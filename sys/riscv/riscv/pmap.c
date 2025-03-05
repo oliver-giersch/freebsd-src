@@ -2444,7 +2444,7 @@ pmap_remove_l2(pmap_t pmap, pt_entry_t *l2, vm_offset_t sva,
 				vm_page_aflag_set(m, PGA_REFERENCED);
 			if (TAILQ_EMPTY(&m->md.pv_list) &&
 			    TAILQ_EMPTY(&pvh->pv_list))
-				vm_page_aflag_clear(m, PGA_WRITEABLE);
+				vm_page_state_clear(m, PGA_WRITEABLE);
 		}
 	}
 	if (pmap == kernel_pmap) {
@@ -2494,7 +2494,7 @@ pmap_remove_l3(pmap_t pmap, pt_entry_t *l3, vm_offset_t va,
 		    (m->flags & PG_FICTITIOUS) == 0) {
 			pvh = pa_to_pvh(VM_PAGE_TO_PHYS(m));
 			if (TAILQ_EMPTY(&pvh->pv_list))
-				vm_page_aflag_clear(m, PGA_WRITEABLE);
+				vm_page_state_clear(m, PGA_WRITEABLE);
 		}
 	}
 
@@ -2681,7 +2681,7 @@ pmap_remove_all(vm_page_t m)
 		free_pv_entry(pmap, pv);
 		PMAP_UNLOCK(pmap);
 	}
-	vm_page_aflag_clear(m, PGA_WRITEABLE);
+	vm_page_state_clear(m, PGA_WRITEABLE);
 	rw_wunlock(&pvh_global_lock);
 	vm_page_free_pages_toq(&free, false);
 }
@@ -3319,7 +3319,7 @@ pmap_enter(pmap_t pmap, vm_offset_t va, vm_page_t m, vm_prot_t prot,
 			    TAILQ_EMPTY(&om->md.pv_list) &&
 			    ((om->flags & PG_FICTITIOUS) != 0 ||
 			    TAILQ_EMPTY(&pa_to_pvh(opa)->pv_list)))
-				vm_page_aflag_clear(om, PGA_WRITEABLE);
+				vm_page_state_clear(om, PGA_WRITEABLE);
 		}
 		pmap_invalidate_page(pmap, va);
 		orig_l3 = 0;
@@ -4174,7 +4174,7 @@ pmap_remove_pages_pv(pmap_t pmap, vm_page_t m, pv_entry_t pv,
 			for (mt = m; mt < &m[Ln_ENTRIES]; mt++)
 				if (TAILQ_EMPTY(&mt->md.pv_list) &&
 				    (mt->a.flags & PGA_WRITEABLE) != 0)
-					vm_page_aflag_clear(mt, PGA_WRITEABLE);
+					vm_page_state_clear(mt, PGA_WRITEABLE);
 		}
 		mpte = pmap_remove_pt_page(pmap, pv->pv_va);
 		if (mpte != NULL) {
@@ -4194,7 +4194,7 @@ pmap_remove_pages_pv(pmap_t pmap, vm_page_t m, pv_entry_t pv,
 		    (m->a.flags & PGA_WRITEABLE) != 0) {
 			pvh = pa_to_pvh(m->phys_addr);
 			if (TAILQ_EMPTY(&pvh->pv_list))
-				vm_page_aflag_clear(m, PGA_WRITEABLE);
+				vm_page_state_clear(m, PGA_WRITEABLE);
 		}
 	}
 }
@@ -4536,7 +4536,7 @@ retry:
 		PMAP_UNLOCK(pmap);
 	}
 	rw_wunlock(lock);
-	vm_page_aflag_clear(m, PGA_WRITEABLE);
+	vm_page_state_clear(m, PGA_WRITEABLE);
 	rw_runlock(&pvh_global_lock);
 }
 

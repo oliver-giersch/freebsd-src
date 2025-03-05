@@ -121,7 +121,7 @@ uintptr_t moea64_get_unique_vsid(void);
  *
  */
 
-#define PV_LOCK_COUNT	PA_LOCK_COUNT
+#define PV_LOCK_COUNT 256
 static struct mtx_padalign pv_lock[PV_LOCK_COUNT];
 
 /*
@@ -2087,7 +2087,7 @@ moea64_remove_write(vm_page_t m)
 	}
 	if ((refchg | atomic_readandclear_32(&m->md.mdpg_attrs)) & LPTE_CHG)
 		vm_page_dirty(m);
-	vm_page_aflag_clear(m, PGA_WRITEABLE);
+	vm_page_state_clear(m, PGA_WRITEABLE);
 	PV_PAGE_UNLOCK(m);
 }
 
@@ -3003,7 +3003,7 @@ moea64_pvo_remove_from_page_locked(struct pvo_entry *pvo,
 		if (m != NULL) {
 			LIST_REMOVE(pvo, pvo_vlink);
 			if (LIST_EMPTY(vm_page_to_pvoh(m)))
-				vm_page_aflag_clear(m,
+				vm_page_state_clear(m,
 				    PGA_WRITEABLE | PGA_EXECUTABLE);
 		}
 	}

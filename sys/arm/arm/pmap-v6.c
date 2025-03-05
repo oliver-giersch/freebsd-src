@@ -2874,7 +2874,7 @@ pmap_pv_reclaim(pmap_t locked_pmap)
 				    (m->flags & PG_FICTITIOUS) == 0) {
 					pvh = pa_to_pvh(VM_PAGE_TO_PHYS(m));
 					if (TAILQ_EMPTY(&pvh->pv_list)) {
-						vm_page_aflag_clear(m,
+						vm_page_state_clear(m,
 						    PGA_WRITEABLE);
 					}
 				}
@@ -3118,7 +3118,7 @@ pmap_remove_entry(pmap_t pmap, vm_page_t m, vm_offset_t va)
 	if (TAILQ_EMPTY(&m->md.pv_list) && (m->flags & PG_FICTITIOUS) == 0) {
 		pvh = pa_to_pvh(VM_PAGE_TO_PHYS(m));
 		if (TAILQ_EMPTY(&pvh->pv_list))
-			vm_page_aflag_clear(m, PGA_WRITEABLE);
+			vm_page_state_clear(m, PGA_WRITEABLE);
 	}
 }
 
@@ -3625,7 +3625,7 @@ pmap_remove_pte1(pmap_t pmap, pt1_entry_t *pte1p, vm_offset_t sva,
 				vm_page_aflag_set(m, PGA_REFERENCED);
 			if (TAILQ_EMPTY(&m->md.pv_list) &&
 			    TAILQ_EMPTY(&pvh->pv_list))
-				vm_page_aflag_clear(m, PGA_WRITEABLE);
+				vm_page_state_clear(m, PGA_WRITEABLE);
 		}
 	}
 	if (pmap == kernel_pmap) {
@@ -4041,7 +4041,7 @@ validate:
 				if (TAILQ_EMPTY(&om->md.pv_list) &&
 				    ((om->flags & PG_FICTITIOUS) != 0 ||
 				    TAILQ_EMPTY(&pa_to_pvh(opa)->pv_list)))
-					vm_page_aflag_clear(om, PGA_WRITEABLE);
+					vm_page_state_clear(om, PGA_WRITEABLE);
 			}
 		} else
 			pte2_store(pte2p, npte2);
@@ -4303,7 +4303,7 @@ small_mappings:
 		free_pv_entry(pmap, pv);
 		PMAP_UNLOCK(pmap);
 	}
-	vm_page_aflag_clear(m, PGA_WRITEABLE);
+	vm_page_state_clear(m, PGA_WRITEABLE);
 	sched_unpin();
 	rw_wunlock(&pvh_global_lock);
 	vm_page_free_pages_toq(&free, false);
@@ -4341,7 +4341,7 @@ pmap_remove_pte1_quick(pmap_t pmap, pt1_entry_t pte1, pv_entry_t pv,
 	if (TAILQ_EMPTY(&pvh->pv_list)) {
 		for (mt = m; mt < &m[PTE1_SIZE / PAGE_SIZE]; mt++)
 			if (TAILQ_EMPTY(&mt->md.pv_list))
-				vm_page_aflag_clear(mt, PGA_WRITEABLE);
+				vm_page_state_clear(mt, PGA_WRITEABLE);
 	}
 	mpt2pg = pmap_pt2_page(pmap, pv->pv_va);
 	if (mpt2pg != NULL)
@@ -4377,7 +4377,7 @@ pmap_remove_pte2_quick(pmap_t pmap, pt2_entry_t pte2, pv_entry_t pv,
 	if (TAILQ_EMPTY(&m->md.pv_list) && (m->flags & PG_FICTITIOUS) == 0) {
 		pvh = pa_to_pvh(pa);
 		if (TAILQ_EMPTY(&pvh->pv_list))
-			vm_page_aflag_clear(m, PGA_WRITEABLE);
+			vm_page_state_clear(m, PGA_WRITEABLE);
 	}
 	pmap_unuse_pt2(pmap, pv->pv_va, free);
 }
@@ -5543,7 +5543,7 @@ small_mappings:
 		}
 		PMAP_UNLOCK(pmap);
 	}
-	vm_page_aflag_clear(m, PGA_WRITEABLE);
+	vm_page_state_clear(m, PGA_WRITEABLE);
 	sched_unpin();
 	rw_wunlock(&pvh_global_lock);
 }

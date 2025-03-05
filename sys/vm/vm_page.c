@@ -61,7 +61,7 @@
  */
 
 /*
- *	Resident memory management module.
+ * Resident memory management module.
  */
 
 #include <sys/cdefs.h>
@@ -114,8 +114,6 @@ struct vm_domain vm_dom[MAXMEMDOM];
 
 DPCPU_DEFINE_STATIC(struct vm_batchqueue, pqbatch[MAXMEMDOM][PQ_COUNT]);
 
-struct mtx_padalign __exclusive_cache_line pa_lock[PA_LOCK_COUNT];
-
 struct mtx_padalign __exclusive_cache_line vm_domainset_lock;
 /* The following fields are protected by the domainset lock. */
 domainset_t __exclusive_cache_line vm_min_domains;
@@ -142,15 +140,18 @@ SYSCTL_COUNTER_U64(_vm_stats_page, OID_AUTO, queue_nops,
     CTLFLAG_RD, &queue_nops,
     "Number of batched queue operations with no effects");
 
+struct vm_page vm_page_array[];
+struct md_page vm_page_md_array[];
+struct vm_pglinks vm_page_links[];
+
+unsigned long vm_page_array_size;
+unsigned first_page;
+
 /*
- * bogus page -- for I/O to/from partially complete buffers,
+ * Bogus page for I/O to/from partially complete buffers,
  * or for paging into sparsely invalid regions.
  */
-vm_page_t bogus_page;
-
-vm_page_t vm_page_array;
-long vm_page_array_size;
-long first_page;
+ struct vm_page *bogus_page;
 
 struct bitset *vm_page_dump;
 long vm_page_dump_pages;
@@ -187,6 +188,9 @@ static int vm_domain_alloc_fail(struct vm_domain *vmd, vm_object_t object,
 static int vm_page_zone_import(void *arg, void **store, int cnt, int domain,
     int flags);
 static void vm_page_zone_release(void *arg, void **store, int cnt);
+
+static unsigned vm_page_marker_page_count(void);
+static void vm_page_init_marker_alloc(unsigned marker_count);
 
 SYSINIT(vm_page, SI_SUB_VM, SI_ORDER_SECOND, vm_page_init, NULL);
 
@@ -391,7 +395,7 @@ vm_page_blacklist_load(char **list, char **end)
 	if (mod != NULL) {
 		ptr = preload_fetch_addr(mod);
 		len = preload_fetch_size(mod);
-        }
+	}
 	*list = ptr;
 	if (ptr != NULL)
 		*end = ptr + len;
@@ -427,7 +431,7 @@ sysctl_vm_page_blacklist(SYSCTL_HANDLER_ARGS)
  * In principle, this function only needs to set the flag PG_MARKER.
  * Nonetheless, it write busies the page as a safety precaution.
  */
-void
+/*void
 vm_page_init_marker(vm_page_t marker, int queue, uint16_t aflags)
 {
 
@@ -436,7 +440,7 @@ vm_page_init_marker(vm_page_t marker, int queue, uint16_t aflags)
 	marker->a.flags = aflags;
 	marker->busy_lock = VPB_CURTHREAD_EXCLUSIVE;
 	marker->a.queue = queue;
-}
+}*/
 
 static void
 vm_page_domain_init(int domain)
@@ -576,6 +580,7 @@ vm_page_startup(vm_offset_t vaddr)
 #ifdef VM_FREEPOOL_LAZYINIT
 	int lazyinit;
 #endif
+	unsigned marker_count;
 
 	vaddr = round_page(vaddr);
 
@@ -587,8 +592,6 @@ vm_page_startup(vm_offset_t vaddr)
 	 * Initialize the page and queue locks.
 	 */
 	mtx_init(&vm_domainset_lock, "vm domainset lock", NULL, MTX_DEF);
-	for (i = 0; i < PA_LOCK_COUNT; i++)
-		mtx_init(&pa_lock[i], "vm page", NULL, MTX_DEF);
 	for (i = 0; i < vm_ndomains; i++)
 		vm_page_domain_init(i);
 
@@ -690,8 +693,10 @@ vm_page_startup(vm_offset_t vaddr)
 	size = high_avail - low_avail;
 #endif
 
+	marker_count = vm_page_marker_page_count();
 #ifdef PMAP_HAS_PAGE_ARRAY
-	pmap_page_array_startup(size / PAGE_SIZE);
+	// FIXME: fix for all arch's!
+	pmap_page_array_startup(size / PAGE_SIZE, marker_count);
 	biggestone = vm_phys_avail_largest();
 	end = new_end = phys_avail[biggestone + 1];
 #else
@@ -727,6 +732,7 @@ vm_page_startup(vm_offset_t vaddr)
 	end = new_end;
 	new_end = vm_page_array_alloc(&vaddr, end, page_range);
 #endif
+	vm_page_init_marker_alloc(marker_count);
 
 #if VM_NRESERVLEVEL > 0
 	/*
@@ -1959,8 +1965,8 @@ vm_page_iter_lookup_ge(struct pctrie_iter *pages, vm_pindex_t pindex)
  *
  * The object must be locked.
  */
-vm_page_t
-vm_page_next(vm_page_t m)
+struct vm_page *
+vm_page_next(const struct vm_page *m)
 {
 	vm_page_t next;
 
@@ -2126,13 +2132,11 @@ vm_page_iter_rename(struct pctrie_iter *old_pages, vm_page_t m,
 }
 
 /*
- *	vm_page_mpred:
- *
- *	Return the greatest page of the object with index <= pindex,
- *	or NULL, if there is none.  Assumes object lock is held.
+ * Return the greatest page of the object with index <= pindex, or NULL, if
+ * there is none.  Assumes object lock is held.
  */
-vm_page_t
-vm_page_mpred(vm_object_t object, vm_pindex_t pindex)
+struct vm_page *
+vm_page_mpred(struct vm_object *object, vm_pindex_t pindex)
 {
 	return (vm_radix_lookup_le(&object->rtree, pindex));
 }
@@ -4407,7 +4411,7 @@ vm_page_unwire_managed(vm_page_t m, uint8_t nqueue, bool noreuse)
 			 */
 			vm_page_release_toq(m, nqueue, noreuse);
 		} else if (count == 1) {
-			vm_page_aflag_clear(m, PGA_DEQUEUE);
+			vm_page_state_clear(m, PGA_DEQUEUE);
 		}
 	} while (!atomic_fcmpset_rel_int(&m->ref_count, &old, old - 1));
 
@@ -4463,7 +4467,7 @@ vm_page_unwire_noq(vm_page_t m)
 	if (VPRC_WIRE_COUNT(old) > 1)
 		return (false);
 	if ((m->oflags & VPO_UNMANAGED) == 0)
-		vm_page_aflag_clear(m, PGA_DEQUEUE);
+		vm_page_state_clear(m, PGA_DEQUEUE);
 	vm_wire_sub(1);
 	return (true);
 }
@@ -4755,7 +4759,7 @@ vm_page_advise(vm_page_t m, int advice)
 	 * Clear any references to the page.  Otherwise, the page daemon will
 	 * immediately reactivate the page.
 	 */
-	vm_page_aflag_clear(m, PGA_REFERENCED);
+	vm_page_state_clear(m, PGA_REFERENCED);
 
 	/*
 	 * Place clean pages near the head of the inactive queue rather than
@@ -5614,7 +5618,7 @@ vm_page_set_validclean(vm_page_t m, int base, int size)
 			 */
 			pmap_clear_modify(m);
 		m->dirty = 0;
-		vm_page_aflag_clear(m, PGA_NOSYNC);
+		vm_page_state_clear(m, PGA_NOSYNC);
 	} else if (oldvalid != VM_PAGE_BITS_ALL && vm_page_xbusied(m))
 		m->dirty &= ~pagebits;
 	else
@@ -5823,42 +5827,56 @@ vm_page_valid(vm_page_t m)
 		vm_page_bits_set(m, &m->valid, VM_PAGE_BITS_ALL);
 }
 
-void
-vm_page_lock_KBI(vm_page_t m, const char *file, int line)
+static unsigned
+vm_page_marker_max_count(void)
 {
+	unsigned count;
 
-	mtx_lock_flags_(vm_page_lockptr(m), 0, file, line);
+	count = (PQ_COUNT + mp_ncpus + 4) * vm_ndomains;
+	return (count);
 }
 
-void
-vm_page_unlock_KBI(vm_page_t m, const char *file, int line)
+static void
+vm_page_init_marker_allocator(unsigned marker_count)
 {
+	struct vm_page_marker_alloc *alloc;
+	struct vm_page_link *markers;
 
-	mtx_unlock_flags_(vm_page_lockptr(m), 0, file, line);
+	alloc = &vm_page_markers;
+	markers = &vm_page_links[vm_page_array_size];
+
+	mtx_init(&alloc->mtx, "marker pglinks", NULL, MTX_DEF);
+	alloc->markers = markers;
+	alloc->start = vm_page_array_size;
+	alloc->count = 0;
+	alloc->max = marker_count;
 }
 
-int
-vm_page_trylock_KBI(vm_page_t m, const char *file, int line)
+static unsigned
+vm_page_marker_alloc(void)
 {
+	struct vm_page_marker_alloc *alloc;
+	unsigned pg;
+	struct vm_pglinks *marker;
 
-	return (mtx_trylock_flags_(vm_page_lockptr(m), 0, file, line));
+	alloc = &vm_page_markers;
+
+	mtx_lock(&alloc->mtx);
+	if (alloc->count == alloc->max)
+		panic("insufficient reserved marker page links");
+	pg = alloc->start + alloc->count;
+	alloc->count += 1;
+
+	marker = &vm_page_links[pg];
+	marker->pq.next = 0;
+	marker->pq.prev = 0
+	marker->pq.state = 0;
+	marker->pq.flags = PGL_MARKER;
+
+	mtx_unlock(&vm_page_markers.mtx);
+
+	return (pg);
 }
-
-#if defined(INVARIANTS) || defined(INVARIANT_SUPPORT)
-void
-vm_page_assert_locked_KBI(vm_page_t m, const char *file, int line)
-{
-
-	vm_page_lock_assert_KBI(m, MA_OWNED, file, line);
-}
-
-void
-vm_page_lock_assert_KBI(vm_page_t m, int a, const char *file, int line)
-{
-
-	mtx_assert_(vm_page_lockptr(m), a, file, line);
-}
-#endif
 
 #ifdef INVARIANTS
 void

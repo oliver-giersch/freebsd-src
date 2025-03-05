@@ -605,7 +605,7 @@ pv_remove(pmap_t pmap, vm_offset_t va, vm_page_t m)
 			/* remove from pv_list */
 			TAILQ_REMOVE(&m->md.pv_list, pve, pv_link);
 			if (TAILQ_EMPTY(&m->md.pv_list))
-				vm_page_aflag_clear(m, PGA_WRITEABLE);
+				vm_page_state_clear(m, PGA_WRITEABLE);
 
 			/* free pv entry struct */
 			pv_free(pve);
@@ -1555,7 +1555,7 @@ mmu_booke_remove_all(vm_page_t m)
 		pte_remove(pv->pv_pmap, pv->pv_va, hold_flag);
 		PMAP_UNLOCK(pv->pv_pmap);
 	}
-	vm_page_aflag_clear(m, PGA_WRITEABLE);
+	vm_page_state_clear(m, PGA_WRITEABLE);
 	rw_wunlock(&pvh_global_lock);
 }
 
@@ -1737,7 +1737,7 @@ mmu_booke_remove_write(vm_page_t m)
 		}
 		PMAP_UNLOCK(pv->pv_pmap);
 	}
-	vm_page_aflag_clear(m, PGA_WRITEABLE);
+	vm_page_state_clear(m, PGA_WRITEABLE);
 	rw_wunlock(&pvh_global_lock);
 }
 

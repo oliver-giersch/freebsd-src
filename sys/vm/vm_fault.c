@@ -323,7 +323,7 @@ vm_fault_dirty(struct faultstate *fs, vm_page_t m)
 		if ((fs->entry->eflags & MAP_ENTRY_NOSYNC) != 0)
 			vm_page_aflag_set(m, PGA_NOSYNC);
 		else
-			vm_page_aflag_clear(m, PGA_NOSYNC);
+			vm_page_state_clear(m, PGA_NOSYNC);
 	}
 
 }

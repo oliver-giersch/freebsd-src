@@ -58,8 +58,8 @@
  * rights to redistribute these changes.
  */
 
-#ifndef	_VM_PAGEQUEUE_
-#define	_VM_PAGEQUEUE_
+#ifndef _VM_PAGEQUEUE_
+#define _VM_PAGEQUEUE_
 
 #ifdef _KERNEL
 struct vm_pagequeue {
@@ -77,7 +77,7 @@ struct vm_pagequeue {
 #endif
 
 struct vm_batchqueue {
-	vm_page_t	bq_pa[VM_BATCHQUEUE_SIZE];
+	struct vm_page	*bq_pa[VM_BATCHQUEUE_SIZE];
 	int		bq_cnt;
 } __aligned(CACHE_LINE_SIZE);
 

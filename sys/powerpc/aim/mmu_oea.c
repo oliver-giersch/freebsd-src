@@ -1424,7 +1424,7 @@ moea_remove_write(vm_page_t m)
 		moea_attr_clear(m, PTE_CHG);
 		vm_page_dirty(m);
 	}
-	vm_page_aflag_clear(m, PGA_WRITEABLE);
+	vm_page_state_clear(m, PGA_WRITEABLE);
 	rw_wunlock(&pvh_global_lock);
 }
 
@@ -1932,7 +1932,7 @@ moea_remove_all(vm_page_t m)
 		moea_attr_clear(m, PTE_CHG);
 		vm_page_dirty(m);
 	}
-	vm_page_aflag_clear(m, PGA_WRITEABLE);
+	vm_page_state_clear(m, PGA_WRITEABLE);
 	rw_wunlock(&pvh_global_lock);
 }
 
@@ -2191,7 +2191,7 @@ moea_pvo_remove(struct pvo_entry *pvo, int pteidx)
 			moea_attr_save(pg, pvo->pvo_pte.pte.pte_lo &
 			    (PTE_REF | PTE_CHG));
 			if (LIST_EMPTY(&pg->md.mdpg_pvoh))
-				vm_page_aflag_clear(pg, PGA_WRITEABLE);
+				vm_page_state_clear(pg, PGA_WRITEABLE);
 		}
 	}
 

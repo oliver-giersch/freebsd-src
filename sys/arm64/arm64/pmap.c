@@ -3237,7 +3237,7 @@ reclaim_pv_chunk_domain(pmap_t locked_pmap, struct rwlock **lockp, int domain)
 				    (m->flags & PG_FICTITIOUS) == 0) {
 					pvh = page_to_pvh(m);
 					if (TAILQ_EMPTY(&pvh->pv_list)) {
-						vm_page_aflag_clear(m,
+						vm_page_state_clear(m,
 						    PGA_WRITEABLE);
 					}
 				}
@@ -3814,7 +3814,7 @@ pmap_remove_l2(pmap_t pmap, pt_entry_t *l2, vm_offset_t sva,
 				vm_page_aflag_set(mt, PGA_REFERENCED);
 			if (TAILQ_EMPTY(&mt->md.pv_list) &&
 			    TAILQ_EMPTY(&pvh->pv_list))
-				vm_page_aflag_clear(mt, PGA_WRITEABLE);
+				vm_page_state_clear(mt, PGA_WRITEABLE);
 		}
 	}
 	if (pmap == kernel_pmap) {
@@ -3866,7 +3866,7 @@ pmap_remove_l3(pmap_t pmap, pt_entry_t *l3, vm_offset_t va,
 		    (m->flags & PG_FICTITIOUS) == 0) {
 			pvh = page_to_pvh(m);
 			if (TAILQ_EMPTY(&pvh->pv_list))
-				vm_page_aflag_clear(m, PGA_WRITEABLE);
+				vm_page_state_clear(m, PGA_WRITEABLE);
 		}
 	}
 	return (pmap_unuse_pt(pmap, va, l2e, free));
@@ -3946,7 +3946,7 @@ pmap_remove_l3c(pmap_t pmap, pt_entry_t *l3p, vm_offset_t va, vm_offset_t *vap,
 			pmap_pvh_free(&mt->md, pmap, tva);
 			if (TAILQ_EMPTY(&mt->md.pv_list) &&
 			    TAILQ_EMPTY(&pvh->pv_list))
-				vm_page_aflag_clear(mt, PGA_WRITEABLE);
+				vm_page_state_clear(mt, PGA_WRITEABLE);
 		}
 	}
 	if (*vap == va_next)
@@ -4051,7 +4051,7 @@ pmap_remove_l3_range(pmap_t pmap, pd_entry_t l2e, vm_offset_t sva,
 			    (m->flags & PG_FICTITIOUS) == 0) {
 				pvh = page_to_pvh(m);
 				if (TAILQ_EMPTY(&pvh->pv_list))
-					vm_page_aflag_clear(m, PGA_WRITEABLE);
+					vm_page_state_clear(m, PGA_WRITEABLE);
 			}
 		}
 		if (l3pg != NULL && pmap_unwire_l3(pmap, sva, l3pg, free)) {
@@ -4292,7 +4292,7 @@ retry:
 		free_pv_entry(pmap, pv);
 		PMAP_UNLOCK(pmap);
 	}
-	vm_page_aflag_clear(m, PGA_WRITEABLE);
+	vm_page_state_clear(m, PGA_WRITEABLE);
 	rw_wunlock(lock);
 	vm_page_free_pages_toq(&free, true);
 }
@@ -5419,7 +5419,7 @@ havel3:
 			    TAILQ_EMPTY(&om->md.pv_list) &&
 			    ((om->flags & PG_FICTITIOUS) != 0 ||
 			    TAILQ_EMPTY(&page_to_pvh(om)->pv_list)))
-				vm_page_aflag_clear(om, PGA_WRITEABLE);
+				vm_page_state_clear(om, PGA_WRITEABLE);
 		} else {
 			KASSERT((orig_l3 & ATTR_AF) != 0,
 			    ("pmap_enter: unmanaged mapping lacks ATTR_AF"));
@@ -7013,7 +7013,7 @@ pmap_remove_pages(pmap_t pmap)
 						for (mt = m; mt < &m[L2_SIZE / PAGE_SIZE]; mt++)
 							if ((mt->a.flags & PGA_WRITEABLE) != 0 &&
 							    TAILQ_EMPTY(&mt->md.pv_list))
-								vm_page_aflag_clear(mt, PGA_WRITEABLE);
+								vm_page_state_clear(mt, PGA_WRITEABLE);
 					}
 					ml3 = pmap_remove_pt_page(pmap,
 					    pv->pv_va);
@@ -7038,7 +7038,7 @@ pmap_remove_pages(pmap_t pmap)
 					    (m->flags & PG_FICTITIOUS) == 0) {
 						pvh = page_to_pvh(m);
 						if (TAILQ_EMPTY(&pvh->pv_list))
-							vm_page_aflag_clear(m,
+							vm_page_state_clear(m,
 							    PGA_WRITEABLE);
 					}
 					break;
@@ -7315,7 +7315,7 @@ retry:
 		PMAP_UNLOCK(pmap);
 	}
 	rw_wunlock(lock);
-	vm_page_aflag_clear(m, PGA_WRITEABLE);
+	vm_page_state_clear(m, PGA_WRITEABLE);
 }
 
 /*

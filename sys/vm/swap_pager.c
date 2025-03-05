@@ -1275,7 +1275,7 @@ swap_pager_unswapped_acct(vm_page_t m)
 	    ("Free object not swappable"));
 	if ((m->a.flags & PGA_SWAP_FREE) != 0)
 		counter_u64_add(swap_free_completed, 1);
-	vm_page_aflag_clear(m, PGA_SWAP_FREE | PGA_SWAP_SPACE);
+	vm_page_state_clear(m, PGA_SWAP_FREE | PGA_SWAP_SPACE);
 
 	/*
 	 * The meta data only exists if the object is OBJT_SWAP
@@ -1636,7 +1636,7 @@ swap_pager_putpages(vm_object_t object, vm_page_t *ma, int count,
 		swblk_iter_init_only(&blks, object);
 		for (j = 0; j < n; ++j) {
 			mreq = ma[i + j];
-			vm_page_aflag_clear(mreq, PGA_SWAP_FREE);
+			vm_page_state_clear(mreq, PGA_SWAP_FREE);
 			KASSERT(mreq->object == object,
 			    ("%s: object mismatch %p/%p",
 			    __func__, mreq->object, object));

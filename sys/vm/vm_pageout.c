@@ -249,7 +249,7 @@ vm_pageout_end_scan(struct scan_state *ss)
 	    ("marker %p not enqueued", ss->marker));
 
 	TAILQ_REMOVE(&pq->pq_pl, ss->marker, plinks.q);
-	vm_page_aflag_clear(ss->marker, PGA_ENQUEUED);
+	vm_page_state_clear(ss->marker, PGA_ENQUEUED);
 	pq->pq_pdpages += ss->scanned;
 }
 
@@ -294,7 +294,7 @@ vm_pageout_collect_batch(struct scan_state *ss, const bool dequeue)
 		(void)vm_batchqueue_insert(&ss->bq, m);
 		if (dequeue) {
 			TAILQ_REMOVE(&pq->pq_pl, m, plinks.q);
-			vm_page_aflag_clear(m, PGA_ENQUEUED);
+			vm_page_state_clear(m, PGA_ENQUEUED);
 		}
 	}
 	TAILQ_REMOVE(&pq->pq_pl, marker, plinks.q);
@@ -1135,6 +1135,32 @@ vm_pageout_active_target(struct vm_domain *vmd)
  * Scan the active queue.  If there is no shortage of inactive pages, scan a
  * small portion of the queue in order to maintain quasi-LRU.
  */
+/*
+1.) pg links (8 byte) -> 20 byte
+2.) astate (2 byte)
+3.) flags (1 byte)    -> 1 byte
+4.) object (8 byte)   -> 8 byte
+5.) aflags (1 byte)   -> 1 byte
+6.) md (24 byte)      -> 24 byte
+== total: 44 bytes !  == 54 byte + pindex + oflags + ...
+
+md -> 16 byte? --> downsize to 8 byte
+
+pg links ----> 16 bytes
+md ----------> 16 bytes
+object ------>  8 bytes
+pindex ------>  8 bytes
+astate ------>  4 bytes
+ref_count --->  4 bytes
+busy_lock --->  4 bytes
+flags ------->  1 bytes
+oflags ------>  1 bytes
+valid ------->  1 bytes
+dirty ------->  1 bytes
+=======================
+               64 bytes
+
+*/
 static void
 vm_pageout_scan_active(struct vm_domain *vmd, int page_shortage)
 {
