@@ -31,20 +31,26 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef	__VM_PHYS_H_
-#define	__VM_PHYS_H_
+#ifndef __VM_PHYS_H_
+#define __VM_PHYS_H_
+
+#include <sys/types.h>
+#include <sys/queue.h>
 
 #include <machine/vmparam.h>
 
 #ifndef VM_NFREEORDER_MAX
-#define	VM_NFREEORDER_MAX	VM_NFREEORDER
+#define VM_NFREEORDER_MAX VM_NFREEORDER
 #endif
 
 struct vm_page;
 #ifndef VM_PAGE_HAVE_PGLIST
 TAILQ_HEAD(pglist, vm_page);
 #define VM_PAGE_HAVE_PGLIST
-#endif
+#endif /* VM_PAGE_HAVE_PGLIST */
+
+struct vm_page;
+struct vm_reserv;
 
 struct vm_freelist {
 	struct pglist pl;
@@ -52,17 +58,17 @@ struct vm_freelist {
 };
 
 struct vm_phys_seg {
-	vm_paddr_t	start;
-	vm_paddr_t	end;
-	vm_page_t	first_page;
+	vm_paddr_t		start;
+	vm_paddr_t		end;
+	struct vm_page		*first_page;
 #if VM_NRESERVLEVEL > 0
-	vm_reserv_t	first_reserv;
-#endif
+	struct vm_reserv	*first_reserv;
+#endif /* VM_NRESERVLEVEL > 0 */
 #ifdef __aarch64__
-	void		*md_first;
-#endif
-	int		domain;
-	struct vm_freelist (*free_queues)[VM_NFREEPOOL][VM_NFREEORDER_MAX];
+	void			*md_first;
+#endif /* __aarch64__ */
+	int			domain;
+	struct vm_freelist 	(*free_queues)[VM_NFREEPOOL][VM_NFREEORDER_MAX];
 };
 
 extern struct vm_phys_seg vm_phys_segs[];
