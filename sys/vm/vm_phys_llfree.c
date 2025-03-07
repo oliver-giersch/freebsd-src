@@ -241,34 +241,37 @@ static inline unsigned
 vm_pgset_alloc_order_1to5(struct vm_pgset *set, uint8_t order)
 {
 	unsigned pages;
-	vm_pgset_t bits, mask;
+	vm_pgset_t mask, bits;
 
 	pages = 1 << order;
 	mask = pages - 1;
 
 	for (unsigned i = 0; i < VM_PGSET_SIZE; i++) {
 		bits = atomic_load_64(&set->free[i]);
-		for (int shift = 0; shift < 64 / pages; shift++, bits >>= pages) {
-			if ((bits & mask) != 0)
-				continue;
-			atomic_set_64(&set->free[i], atomic_t *v)
-			/* ok now cas*/
+		for (int shift = 0; shift < 64 / pages; shift++,
+		    mask <<= pages) {
+			while (true) {
+				if ((bits & mask) != 0)
+					break;
+
+				if (!atomic_fcmpset_64(&set->free[i], &bits,
+				    bits | mask))
+					return (shift * pages);
+			}
 		}
-		/*
-		 *  2 (64 /  2 = 32 shifts) -> 0b11
-		 *  4 (64 /  4 = 16 shifts) -> 0b1111
-		 *  8 (64 /  8 =  8 shifts) -> 0b11111111 (2^8 - 1)
-		 * 16 (64 / 16 =  4 shifts) -> 0b11111111...
-		 * 32 (64 / 32 =  2 shifts) -> ...
-		 */
 	}
-	// can fail (ret -1)
-	// otherwise return index of first page (2..32)
+
+	return (-1);
 }
 
 static inline unsigned
 vm_pgset_alloc_order_6to8(struct vm_pgset *set, uint8_t order)
 {
+	/*
+	 *   -  O6(64):   cas(tree), cas(count), find  1 word w/ all zeroes  [may revert]
+	 *   -  O7(128):  cas(tree), cas(count), find  2 word w/ all zeroes  [may revert 2x]
+	 *   -  O8(256):  cas(tree), cas(count), find  4 word w/ all zeroes  [may revert 4x]
+	 */
 	return (-1);
 }
 
