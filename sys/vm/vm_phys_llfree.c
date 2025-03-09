@@ -415,11 +415,29 @@ vm_pgset_alloc_order_1to5(struct vm_pgset *set, uint8_t order)
 static inline unsigned
 vm_pgset_alloc_order_6to8(struct vm_pgset *set, uint8_t order)
 {
-	/*
-	 *   -  O6(64):   cas(tree), cas(count), find  1 word w/ all zeroes  [may revert]
-	 *   -  O7(128):  cas(tree), cas(count), find  2 word w/ all zeroes  [may revert 2x]
-	 *   -  O8(256):  cas(tree), cas(count), find  4 word w/ all zeroes  [may revert 4x]
-	 */
+	unsigned words, word;
+	vm_pgset_t bits;
+
+	words = (1 << order) / 64;
+
+	for (unsigned i = 0; i < VM_PGSET_SIZE; i += words) {
+		for (word = 0; word < words; word++) {
+			bits = atomic_load_64(&set->free[i + word]);
+			do {
+				if (bits != 0)
+					goto revert;
+			} while (atomic_fcmpset_64(&set->free[i + word], &bits,
+			    ~(vm_pgset_t)0));
+		}
+
+		return (i);
+
+revert:
+		for (unsigned w = 0; w < word; w++)
+			atomic_store_64(&set->free[i + w], 0);
+		continue;
+	}
+
 	return (-1);
 }
 
