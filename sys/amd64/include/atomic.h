@@ -187,6 +187,22 @@ ATOMIC_CMPSET(long);
  * Atomically add the value of v to the integer pointed to by p and return
  * the previous value of *p.
  */
+static inline u_short
+atomic_fetchadd_short(volatile u_short *p, u_short v)
+{
+	__asm __volatile(
+	" lock; xaddw	%0,%1 ;		"
+	"# atomic_fetchadd_short"
+	: "+r" (v),			/* 0 */
+	  "+m" (*p)			/* 1 */
+	: : "cc");
+	return (v);
+}
+
+/*
+ * Atomically add the value of v to the integer pointed to by p and return
+ * the previous value of *p.
+ */
 static __inline u_int
 atomic_fetchadd_int(volatile u_int *p, u_int v)
 {
@@ -510,6 +526,7 @@ atomic_swap_long(volatile u_long *p, u_long v)
 #define	atomic_fcmpset_16	atomic_fcmpset_short
 #define	atomic_fcmpset_acq_16	atomic_fcmpset_acq_short
 #define	atomic_fcmpset_rel_16	atomic_fcmpset_rel_short
+#define	atomic_fetchadd_16	atomic_fetchadd_short
 
 /* Operations on 32-bit double words. */
 #define	atomic_set_32		atomic_set_int

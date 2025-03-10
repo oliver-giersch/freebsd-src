@@ -2,6 +2,7 @@
 #include <sys/types.h>
 #include <sys/pcpu.h>
 #include <sys/proc.h>
+#include <sys/domainset.h>
 
 #include <vm/vm.h>
 #include <vm/vm_param.h>
@@ -92,11 +93,6 @@ DPCPU_DEFINE_STATIC(union vm_pcpu_tree, reserved_tree[MAXMEMDOM]);
 static vm_pgidx_t
 vm_phys_alloc_domain(struct vm_phys_domain *domain, uint8_t order);
 
-static inline union vm_pgtree vm_pgtree_load(const union vm_pgtree *tree);
-static inline int vm_pgtree_fcmpset(union vm_pgtree *tree, union vm_pgtree *old,
-    union vm_pgtree new)
-static inline bool vm_pgtree_alloc(union vm_pgtree *tree, uint8_t order);
-
 static inline unsigned vm_pcpu_tree_get_tree(union vm_pcpu_tree local);
 static inline union vm_pcpu_tree vm_pcpu_tree_load(
     const union vm_pcpu_tree *local);
@@ -106,6 +102,11 @@ static bool vm_pcpu_tree_alloc(union vm_pcpu_tree *local,
     union vm_pcpu_tree old, uint16_t pages);
 static bool vm_pcpu_tree_alloc_sync(union vm_pcpu_tree *local,
     union vm_pcpu_tree old_local, uint16_t wanted_pgs);
+
+static inline union vm_pgtree vm_pgtree_load(const union vm_pgtree *tree);
+static inline int vm_pgtree_fcmpset(union vm_pgtree *tree, union vm_pgtree *old,
+    union vm_pgtree new);
+static inline bool vm_pgtree_alloc(union vm_pgtree *tree, uint8_t order);
 
 static inline bool vm_pgcount_alloc_order_9(union vm_pgcount *count);
 static inline void vm_pgcount_free_order_0to8(union vm_pgcount *count,
@@ -131,7 +132,7 @@ vm_phys_domain_alloc(struct vm_phys_domain *domain, uint8_t order)
 	critical_enter();
 	local = DPCPU_PTR(reserved_tree[domain->id]);
 	old = vm_pcpu_tree_load(local);
-	if (vm_pcpu_tree_alloc(local, pages)) {
+	if (vm_pcpu_tree_alloc(local, old, pages)) {
 		tree_idx = vm_pcpu_tree_get_tree(old);
 		// vm_pgtree_alloc_search_order_0to8(...)
 		// then, use the offset to get the pgset, and do the allocation there (some fallible, some infallibel!)
@@ -144,57 +145,6 @@ vm_phys_domain_alloc(struct vm_phys_domain *domain, uint8_t order)
 
 exit:
 	critical_exit();
-}
-
-static inline union vm_pgtree
-vm_pgtree_load(const union vm_pgtree *tree)
-{
-	union vm_pgtree val;
-
-	val.bits = atomic_load_16(&tree->bits);
-
-	return (val);
-}
-
-static inline int
-vm_pgtree_fcmpset(union vm_pgtree *tree, union vm_pgtree *old,
-    union vm_pgtree new)
-{
-	return (atomic_fcmpset_16(&tree->bits, &old->bits, new.bits));
-}
-
-/*
- * tree's free count has already been decremented, now needs to find a consecutive slice of pages that work
- */
-static unsigned
-vm_pgtree_alloc_search_order_0to8(union vm_pgcount counts[VM_PGTREE_SETS],
-    uint8_t order)
-{
-	for (unsigned count = 0; count < VM_PGTREE_SETS; count++) {
-		if (!vm_pgcount_alloc_order_0to8)
-			continue;
-		return (count);
-	}
-
-	return (-1);
-}
-
-static inline bool
-vm_pgtree_alloc(union vm_pgtree *tree, uint8_t order)
-{
-	union vm_pgtree old, new;
-	unsigned pages;
-
-	pages = 1 << order;
-	old = vm_pgtree_load(tree);
-	do {
-		if (old.count < pages)
-			return (false);
-		new = old;
-		new.count -= pages;
-	} while (vm_pgtree_fcmpset(tree, &old, new));
-
-	return (true);
 }
 
 static inline unsigned
@@ -259,7 +209,6 @@ vm_pcpu_tree_alloc(union vm_pcpu_tree *local, union vm_pcpu_tree old,
 	 * - deduce count (by CAS) from referenced tree (which must *not* change)
 	 */
 	union vm_pcpu_tree new;
-	union vm_pgtree tree;
 
 	CRITICAL_ASSERT(curthread);
 	do {
@@ -271,11 +220,12 @@ vm_pcpu_tree_alloc(union vm_pcpu_tree *local, union vm_pcpu_tree old,
 			return (false);
 
 		/*
-		 * If there are fewer free pages than the requested amount, try to sync
-		 * with the global free count for the page tree.
+		 * If there are fewer free pages than the requested amount,
+		 * try to sync with the global free count for the page tree.
 		 */
 		if (old.free < pages)
-			return (vm_pcpu_tree_alloc_sync(local, old, pages - old.free));
+			return (vm_pcpu_tree_alloc_sync(local, old,
+			    pages - old.free));
 
 		new = old;
 		new.free -= pages;
@@ -286,25 +236,26 @@ vm_pcpu_tree_alloc(union vm_pcpu_tree *local, union vm_pcpu_tree old,
 
 // XXX: pass in uint16_t request to handle the page allocation in one go!
 static bool
-vm_pcpu_tree_alloc_sync(union vm_pcpu_tree *local, union vm_pcpu_tree old_local,
+vm_pcpu_tree_alloc_sync(union vm_pcpu_tree *local, union vm_pcpu_tree old,
     uint16_t wanted_pgs)
 {
-	union vm_pgtree *tree, old, new;
+	union vm_pcpu_tree new;
+	union vm_pgtree *tree, old_tree, new_tree;
 	uint16_t pages, add_pages;
 	bool res;
 
 	CRITICAL_ASSERT(curthread);
-	tree = vm_pcpu_tree_get_tree(old_local);
-	old = vm_pgtree_load(tree);
+	tree = &pgtrees[vm_pcpu_tree_get_tree(old)];
+	old_tree = vm_pgtree_load(tree);
 	pages = 0;
 
 	// Reset the global tree's freecount to zero.
 	do {
-		if (!old.reserved || (pages = old.count) == 0)
+		if (!old_tree.reserved || (pages = old_tree.free) == 0)
 			return (false);
-		new = old;
-		new.count = 0;
-	} while (vm_pgtree_fcmpset(tree, &old, new));
+		new_tree = old_tree;
+		new_tree.free = 0;
+	} while (vm_pgtree_fcmpset(tree, &old_tree, new_tree));
 
 	if (pages >= wanted_pgs) {
 		add_pages = pages - wanted_pgs;
@@ -316,17 +267,68 @@ vm_pcpu_tree_alloc_sync(union vm_pcpu_tree *local, union vm_pcpu_tree old_local,
 
 	// Add the acquired number of global tree pages to the local tree.
 	do {
-		if (!old_local.reserved)
+		if (!old.reserved)
 			goto release;
-		new_local = *old_local;
-		new_local.free += add_pages;
-	} while (vm_pcpu_tree_fcmpset(local, &old_local, new_local));
+		new = old;
+		new.free += add_pages;
+	} while (vm_pcpu_tree_fcmpset(local, &old, new));
 
 	return (res);
 
 release:
-	atomic_fetchadd_64(&tree->bits, pages);
+	atomic_fetchadd_16(&tree->bits, pages);
 	return (0);
+}
+
+static inline union vm_pgtree
+vm_pgtree_load(const union vm_pgtree *tree)
+{
+	union vm_pgtree val;
+
+	val.bits = atomic_load_16(&tree->bits);
+
+	return (val);
+}
+
+static inline int
+vm_pgtree_fcmpset(union vm_pgtree *tree, union vm_pgtree *old,
+    union vm_pgtree new)
+{
+	return (atomic_fcmpset_16(&tree->bits, &old->bits, new.bits));
+}
+
+/*
+ * tree's free count has already been decremented, now needs to find a consecutive slice of pages that work
+ */
+static unsigned
+vm_pgtree_alloc_search_order_0to8(union vm_pgcount counts[VM_PGTREE_SETS],
+    uint8_t order)
+{
+	for (unsigned count = 0; count < VM_PGTREE_SETS; count++) {
+		if (!vm_pgcount_alloc_order_0to8)
+			continue;
+		return (count);
+	}
+
+	return (-1);
+}
+
+static inline bool
+vm_pgtree_alloc(union vm_pgtree *tree, uint8_t order)
+{
+	union vm_pgtree old, new;
+	unsigned pages;
+
+	pages = 1 << order;
+	old = vm_pgtree_load(tree);
+	do {
+		if (old.count < pages)
+			return (false);
+		new = old;
+		new.count -= pages;
+	} while (vm_pgtree_fcmpset(tree, &old, new));
+
+	return (true);
 }
 
 static inline void
