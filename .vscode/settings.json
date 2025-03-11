@@ -1,0 +1,25 @@
+{
+    "editor.formatOnSave": false,
+    "editor.renderWhitespace": "all",
+    "editor.tabSize": 8,
+    "editor.rulers": [ 80 ],
+    "files.associations": {
+        "*.c": "c",
+        "*.h": "c"
+    },
+    "[shellscript]": {
+        "editor.insertSpaces": false
+    },
+    "[c]": {
+        "editor.tabSize": 8,
+        "editor.insertSpaces": false
+    },
+    "[json]": {
+        "editor.tabSize": 2
+    },
+    "clangd.arguments": [
+        "--background-index",
+        "--header-insertion=never"
+    ]
+}
+
