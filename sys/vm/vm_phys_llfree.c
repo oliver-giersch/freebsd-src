@@ -41,9 +41,8 @@ enum {
 
 /* 1 LLFree "instance" per domain. */
 struct vm_phys_domain {
-	vm_paddr_t start;
-	vm_paddr_t end;
-	unsigned start_seg;
+	vm_paddr_t start, end;
+	uint8_t start_seg, end_seg;
 	domainid_t id;
 };
 
@@ -140,6 +139,8 @@ static vm_pgidx_t vm_pcpu_tree_alloc_search_order_10to12(uint8_t order,
     unsigned treeset_idx);
 static void vm_pcpu_tree_revert(union vm_pcpu_tree *local,
     union vm_pcpu_tree old, uint16_t pages);
+static bool vm_pcpu_tree_unreserve(union vm_pcpu_tree *local,
+    union vm_pcpu_tree *old);
 
 static inline union vm_pgtree vm_pgtree_load(const union vm_pgtree *tree);
 static inline int vm_pgtree_fcmpset(union vm_pgtree *tree, union vm_pgtree *old,
@@ -147,6 +148,8 @@ static inline int vm_pgtree_fcmpset(union vm_pgtree *tree, union vm_pgtree *old,
 static inline bool vm_pgtree_sync(union vm_pgtree *tree, uint16_t *pages);
 static inline union vm_pgtree vm_pgtree_fetchadd(union vm_pgtree *tree,
     uint16_t pages);
+static inline union vm_pgtree *vm_pgtree_get_neighbors(union vm_pgtree *tree);
+static void vm_pgtree_unreserve(union vm_pgtree *tree, uint16_t pages);
 
 static inline union vm_pgcount vm_pgcount_load(
     volatile union vm_pgcount *count);
@@ -197,16 +200,26 @@ vm_phys_domain_alloc(struct vm_phys_domain *domain, uint8_t order)
 
 	pages = 1 << order;
 	critical_enter();
+
+restart:
 	local = DPCPU_PTR(reserved_tree[domain->id]);
 	old = vm_pcpu_tree_load(local);
 	if (vm_pcpu_tree_alloc(local, old, pages)) {
 		pg = vm_pcpu_tree_alloc_search(local, old, order, pages);
 		if (pg == invalid_pgidx) {
-			// FIXME: unreserve tree, search for another one, repeat
+			// 1) unreserve tree
+			// 2) search neighbourhood of previous tree
+			// 3) search (domain) trees sequentially
 		}
 
 		critical_exit();
 	}
+	// 1) unreserve tree
+	// 2) search neighbors
+	// 3) search sequentially (may skip neighbor range)
+	// 4) search again, this time not skipping almost full/empty trees
+	// 5) unreserve all local trees, try to reserve one of those
+	// 6) give up
 }
 
 static vm_pgidx_t
@@ -220,7 +233,7 @@ vm_phys_alloc_domain_contig(struct vm_phys_domain *domain, uint16_t pages,
 	 * - search for a suitable range, i.e. a run of free bits
 	 * - then reserve the associated pgtree and allocate from it
 	 */
-	unsigned segind;
+	unsigned i;
 	struct vm_phys_seg *seg;
 	vm_paddr_t range[2];
 
@@ -230,8 +243,8 @@ vm_phys_alloc_domain_contig(struct vm_phys_domain *domain, uint16_t pages,
 	if (low >= high || high <= domain->start || domain->end <= low)
 		return (invalid_pgidx);
 
-	for (segind = domain->start_seg; segind < phys_segments.len; segind++) {
-		seg = &phys_segments.array[segind];
+	for (i = domain->end_seg - 1; i >= domain->start_seg; i--) {
+		seg = &phys_segments.array[i];
 		if (seg->start >= high)
 			break;
 		if (low >= seg->end)
@@ -242,6 +255,8 @@ vm_phys_alloc_domain_contig(struct vm_phys_domain *domain, uint16_t pages,
 
 		if (range[1] - range[0] < ptoa(pages))
 			continue;
+		//order 0-12: regular
+		//order 12-_: allocate consecutive blocks of full O15 trees
 	}
 
 	return (invalid_pgidx);
@@ -269,6 +284,33 @@ vm_pcpu_tree_fcmpset(union vm_pcpu_tree *local, union vm_pcpu_tree *old,
     union vm_pcpu_tree new)
 {
 	return (atomic_fcmpset_64(&local->bits, &old->bits, new.bits));
+}
+
+static bool
+vm_domain_search_tree(struct vm_phys_domain *domain, union vm_pcpu_tree *local,
+    union vm_pcpu_tree old)
+{
+	union vm_pgtree *tree, *neighbors;
+
+	/*
+	 * First, unreserve the local tree.  If that succeeds, unreserve the
+	 * global tree as well and synchronize its free count.
+	 */
+	tree = &pgtrees[vm_pcpu_tree_get_tree(old)];
+	if (vm_pcpu_tree_unreserve(local, &old)) {
+		tree = &pgtrees[vm_pcpu_tree_get_tree(old)];
+		vm_pgtree_unreserve(tree, old.free);
+	}
+
+	// 1) unreserve tree
+	// 2) search neighbors
+	// 3) search sequentially (may skip neighbor range)
+	// 4) search again, this time not skipping almost full/empty trees
+	// 5) unreserve all local trees, try to reserve one of those
+	// 6) give up
+	neighbors = vm_pgtree_get_neighbors(tree);
+
+	return (false);
 }
 
 // Must allocate less than 2^15 pages (for now)
@@ -358,6 +400,9 @@ vm_pcpu_tree_alloc_search(union vm_pcpu_tree *local, union vm_pcpu_tree old,
 
 	return (pg);
 }
+
+static bool
+
 
 static vm_pgidx_t
 vm_pcpu_tree_alloc_search_order_0to9(uint8_t order, uint16_t pages,
@@ -527,6 +572,29 @@ vm_pcpu_tree_revert(union vm_pcpu_tree *local, union vm_pcpu_tree old,
 	(void)vm_pgtree_fetchadd(tree, pages);
 }
 
+static bool
+vm_pcpu_tree_unreserve(union vm_pcpu_tree *local, union vm_pcpu_tree *old)
+{
+	union vm_pcpu_tree new;
+
+	CRITICAL_ASSERT(curthread);
+	KASSERT(old->reserved, ("%s: local tree not reserved", __func__));
+
+	do {
+		/*
+		 * Another thread may concurrently have unreserved the tree,
+		 * in which case it would also have zeroed the (local) free
+		 * count and assumed responsibility for also unreserving the
+		 * global tree.
+		 */
+		if (!old->reserved)
+			return (false);
+		new = *old;
+		new.reserved = false;
+		new.free = 0;
+	} while (vm_pcpu_tree_fcmpset(local, old, new));
+}
+
 static inline union vm_pgtree
 vm_pgtree_load(const union vm_pgtree *tree)
 {
@@ -552,6 +620,50 @@ vm_pgtree_fetchadd(union vm_pgtree *tree, uint16_t pages)
 	val.bits = atomic_fetchadd_16(&tree->bits, pages);
 
 	return (val);
+}
+
+static inline union vm_pgtree *
+vm_pgtree_get_neighbors(union vm_pgtree *tree)
+{
+	return ((union vm_pgtree *)((uintptr_t)tree & (CACHE_LINE_SIZE - 1)));
+}
+
+/*
+ * Who can unreserve a tree?
+ *   - the owning CPU, if it can't find a free tree
+ *   - any other CPU *without* a currently reserved tree
+ *
+ * 1) unreserve the local tree, zero its free count (!)
+ * 2) the thread which "did the deed" *has* to unreserve the global one as well (?)
+ * 3) better: any thread can do it, but can't because of ABA issues -> not lockfree,
+ *    but this is, in the end, not critical, it just means the tree may not be
+ *    available for a while and lead to "minor starvation" and OOM too early in extremely rare cases
+ */
+static void
+vm_pgtree_unreserve(union vm_pgtree *tree, uint16_t pages)
+{
+	union vm_pgtree old, new;
+
+	old = vm_pgtree_load(tree);
+	do {
+		/*
+		 * Another thread may unreserve the tree, but this thread *must*
+		 * release the previously reserved free page count.
+		 * D'oh: ABA problem persists!
+		 * It may be possible to "accidentally" unreserve a tree that is
+		 * actually reserved by some other thread. this can, in fact
+		 * lead to a cascade, where the threads do not agree on who
+		 * reserves which reserves which tree.
+		 * Lars et al. avoid ABA by making this stuff not lock-free,
+		 * damn cheaters!
+		 * Not really possible to avoid with this small amount of bits,
+		 * would need to store the cpu id as well, increasing each pgcount
+		 * to 32-bits
+		 */
+		new = old;
+		new.free += pages;
+		new.reserved = false;
+	} while (vm_pgtree_fcmpset(tree, &old, new));
 }
 
 static inline bool
