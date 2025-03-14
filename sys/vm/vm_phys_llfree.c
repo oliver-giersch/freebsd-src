@@ -1,8 +1,9 @@
 #include <sys/cdefs.h>
+#include <sys/domainset.h>
 #include <sys/types.h>
 #include <sys/pcpu.h>
 #include <sys/proc.h>
-#include <sys/domainset.h>
+#include <sys/smp.h>
 
 #include <vm/vm.h>
 #include <vm/vm_param.h>
@@ -37,6 +38,9 @@ enum {
 	VM_PGTREE_BITS	= 15,
 	VM_PGTREE_COUNT	= 1 << VM_PGTREE_BITS,
 	VM_PGTREE_SETS	= VM_PGTREE_COUNT / VM_PGSET_COUNT,
+
+	VM_PGTREE_ALMOST_EMPTY = 4096,
+	VM_PGTREE_ALMOST_FULL = VM_PGTREE_COUNT - VM_PGTREE_ALMOST_EMPTY,
 };
 
 /* 1 LLFree "instance" per domain. */
@@ -48,10 +52,14 @@ struct vm_phys_domain {
 
 union vm_pgtree {
 	struct {
-		uint16_t	free     : 15;
+		uint16_t	free     : VM_PGTREE_BITS;
 		bool		reserved : 1;
 	} __packed;
 	uint16_t		bits;
+};
+
+enum {
+	VM_PGTREE_NEIGHBORS	= CACHE_LINE_SIZE / sizeof(union vm_pgtree),
 };
 
 _Static_assert(sizeof(union vm_pgtree) == sizeof(uint16_t),
@@ -122,6 +130,10 @@ static vm_pgidx_t
 vm_phys_alloc_domain_contig(struct vm_phys_domain *domain, uint16_t pages,
     vm_paddr_t low, vm_paddr_t high, vm_align_t alignment, vm_paddr_t boundary);
 
+static union vm_pgtree *vm_phys_domain_search_tree(
+    struct vm_phys_domain *domain, union vm_pcpu_tree *local,
+    union vm_pcpu_tree old, uint16_t pages);
+
 static inline unsigned vm_pcpu_tree_get_tree(union vm_pcpu_tree local);
 static inline union vm_pcpu_tree vm_pcpu_tree_load(
     const union vm_pcpu_tree *local);
@@ -149,6 +161,15 @@ static inline bool vm_pgtree_sync(union vm_pgtree *tree, uint16_t *pages);
 static inline union vm_pgtree vm_pgtree_fetchadd(union vm_pgtree *tree,
     uint16_t pages);
 static inline union vm_pgtree *vm_pgtree_get_neighbors(union vm_pgtree *tree);
+static union vm_pgtree * vm_pgtree_reserve_search_neighbors(
+    union vm_pgtree trees[VM_PGTREE_NEIGHBORS], union vm_pgtree *skip,
+    uint16_t min, uint16_t max, uint16_t pages);
+static union vm_pgtree * vm_pgtree_reserve_search_all(
+    unsigned len, union vm_pgtree all[len],
+    union vm_pgtree skip[VM_PGTREE_NEIGHBORS], uint16_t min, uint16_t max,
+    uint16_t pages);
+static bool vm_pgtree_reserve(union vm_pgtree *tree, uint16_t min, uint16_t max,
+    uint16_t pages);
 static void vm_pgtree_unreserve(union vm_pgtree *tree, uint16_t pages);
 
 static inline union vm_pgcount vm_pgcount_load(
@@ -197,29 +218,36 @@ vm_phys_domain_alloc(struct vm_phys_domain *domain, uint8_t order)
 	union vm_pcpu_tree *local, old;
 	uint16_t pages;
 	vm_pgidx_t pg;
+	union vm_pgtree *tree;
 
 	pages = 1 << order;
+	tree = NULL;
 	critical_enter();
 
-restart:
 	local = DPCPU_PTR(reserved_tree[domain->id]);
-	old = vm_pcpu_tree_load(local);
-	if (vm_pcpu_tree_alloc(local, old, pages)) {
-		pg = vm_pcpu_tree_alloc_search(local, old, order, pages);
-		if (pg == invalid_pgidx) {
-			// 1) unreserve tree
-			// 2) search neighbourhood of previous tree
-			// 3) search (domain) trees sequentially
+	while (true) {
+		old = vm_pcpu_tree_load(local);
+		if (vm_pcpu_tree_alloc(local, old, pages)) {
+			pg = vm_pcpu_tree_alloc_search(local, old, order,
+			    pages);
+			if (pg != invalid_pgidx)
+				goto exit;
 		}
 
-		critical_exit();
+		// this could be niceer
+		if (tree)
+			vm_pgtree_unreserve(tree, pages);
+	
+		tree = vm_phys_domain_search_tree(domain, local, old, pages);
+		if (tree == NULL) {
+			critical_exit();
+			return (invalid_pgidx);
+		}
 	}
-	// 1) unreserve tree
-	// 2) search neighbors
-	// 3) search sequentially (may skip neighbor range)
-	// 4) search again, this time not skipping almost full/empty trees
-	// 5) unreserve all local trees, try to reserve one of those
-	// 6) give up
+
+exit:
+	critical_exit();
+	return (pg);
 }
 
 static vm_pgidx_t
@@ -262,6 +290,79 @@ vm_phys_alloc_domain_contig(struct vm_phys_domain *domain, uint16_t pages,
 	return (invalid_pgidx);
 }
 
+static union vm_pgtree *
+vm_phys_domain_search_tree(struct vm_phys_domain *domain,
+    union vm_pcpu_tree *local, union vm_pcpu_tree old, uint16_t pages)
+{
+	union vm_pgtree *tree, *neighbors;
+	union vm_pcpu_tree *remote;
+	uint16_t min, max;
+	int cpu;
+
+	CRITICAL_ASSERT(curthread);
+
+	/*
+	 * First, unreserve the local tree.  If that succeeds, unreserve the
+	 * global tree as well and synchronize its free count.
+	 */
+	tree = &pgtrees[vm_pcpu_tree_get_tree(old)];
+	if (vm_pcpu_tree_unreserve(local, &old)) {
+		tree = &pgtrees[vm_pcpu_tree_get_tree(old)];
+		vm_pgtree_unreserve(tree, old.free);
+	}
+
+	// 1) unreserve tree
+	// 2) search neighbors
+	// 3) search sequentially (may skip neighbor range)
+	// 4) search again, this time not skipping almost full/empty trees
+	// 5) unreserve all local trees, try to reserve one of those
+	// 6) give up
+
+	/*
+	 * Search the trees in the immediate neighborhood of the previous tree.
+	 * Neighborhood is defined as "on the same cache line".
+	 */
+	neighbors = vm_pgtree_get_neighbors(tree);
+	min = VM_PGTREE_ALMOST_EMPTY;
+	max = VM_PGTREE_ALMOST_FULL;
+
+	tree = vm_pgtree_reserve_search_neighbors(
+	    neighbors, tree, min, max, pages);
+	if (tree)
+		return (tree);
+
+	tree = vm_pgtree_reserve_search_neighbors(
+	    neighbors, tree, min, 0, pages);
+	if (tree)
+		return (tree);
+
+	tree = vm_pgtree_reserve_search_neighbors(
+	    neighbors, tree, 0, 0, pages);
+	if (tree)
+		return (tree);
+
+	/*
+	 * Search for any free tree in the domain.
+	 */
+	// ...
+
+	/*
+	 * Unreserve all CPU reserved trees.
+	 */
+	CPU_FOREACH(cpu) {
+		if (cpu == curcpu)
+			continue;
+		remote = DPCPU_ID_PTR(cpu, reserved_tree[domain->id]);
+		old = vm_pcpu_tree_load(remote);
+		if (vm_pcpu_tree_unreserve(remote, &old)) {
+			tree = &pgtrees[vm_pcpu_tree_get_tree(old)];
+			vm_pgtree_unreserve(tree, old.free);
+		}
+	}
+
+	return (NULL);
+}
+
 static inline unsigned
 vm_pcpu_tree_get_tree(union vm_pcpu_tree local)
 {
@@ -284,33 +385,6 @@ vm_pcpu_tree_fcmpset(union vm_pcpu_tree *local, union vm_pcpu_tree *old,
     union vm_pcpu_tree new)
 {
 	return (atomic_fcmpset_64(&local->bits, &old->bits, new.bits));
-}
-
-static bool
-vm_domain_search_tree(struct vm_phys_domain *domain, union vm_pcpu_tree *local,
-    union vm_pcpu_tree old)
-{
-	union vm_pgtree *tree, *neighbors;
-
-	/*
-	 * First, unreserve the local tree.  If that succeeds, unreserve the
-	 * global tree as well and synchronize its free count.
-	 */
-	tree = &pgtrees[vm_pcpu_tree_get_tree(old)];
-	if (vm_pcpu_tree_unreserve(local, &old)) {
-		tree = &pgtrees[vm_pcpu_tree_get_tree(old)];
-		vm_pgtree_unreserve(tree, old.free);
-	}
-
-	// 1) unreserve tree
-	// 2) search neighbors
-	// 3) search sequentially (may skip neighbor range)
-	// 4) search again, this time not skipping almost full/empty trees
-	// 5) unreserve all local trees, try to reserve one of those
-	// 6) give up
-	neighbors = vm_pgtree_get_neighbors(tree);
-
-	return (false);
 }
 
 // Must allocate less than 2^15 pages (for now)
@@ -400,8 +474,6 @@ vm_pcpu_tree_alloc_search(union vm_pcpu_tree *local, union vm_pcpu_tree old,
 
 	return (pg);
 }
-
-static bool
 
 
 static vm_pgidx_t
@@ -578,7 +650,7 @@ vm_pcpu_tree_unreserve(union vm_pcpu_tree *local, union vm_pcpu_tree *old)
 	union vm_pcpu_tree new;
 
 	CRITICAL_ASSERT(curthread);
-	KASSERT(old->reserved, ("%s: local tree not reserved", __func__));
+	//sKASSERT(old->reserved, ("%s: local tree not reserved", __func__));
 
 	do {
 		/*
@@ -626,6 +698,58 @@ static inline union vm_pgtree *
 vm_pgtree_get_neighbors(union vm_pgtree *tree)
 {
 	return ((union vm_pgtree *)((uintptr_t)tree & (CACHE_LINE_SIZE - 1)));
+}
+
+static union vm_pgtree *
+vm_pgtree_reserve_search_neighbors(
+    union vm_pgtree neighbors[VM_PGTREE_NEIGHBORS], union vm_pgtree *skip,
+    uint16_t min, uint16_t max, uint16_t pages)
+{
+	union vm_pgtree *tree;
+
+	for (unsigned i = 0; i < VM_PGTREE_NEIGHBORS; i++) {
+		tree = &neighbors[i];
+		if (tree == skip)
+			continue;
+		if (!vm_pgtree_reserve(tree, min, max, pages))
+			continue;
+		return (tree);
+	}
+
+	return (NULL);
+}
+
+static union vm_pgtree *
+vm_pgtree_reserve_search_all(unsigned len, union vm_pgtree all[len],
+    union vm_pgtree skip[VM_PGTREE_NEIGHBORS], uint16_t min, uint16_t max,
+    uint16_t pages)
+{
+	return (NULL);
+}
+
+static bool
+vm_pgtree_reserve(union vm_pgtree *tree, uint16_t min, uint16_t max,
+    uint16_t pages)
+{
+	union vm_pgtree old, new;
+
+	old = vm_pgtree_load(tree);
+	do {
+		if (old.reserved)
+			return (false);
+		if (old.free < pages)
+			return (false);
+		if (max && old.free > max)
+			return (false);
+		if (old.free < min)
+			return (false);
+
+		new = old;
+		new.free = old.free - pages;
+		new.reserved = true;
+	} while (vm_pgtree_fcmpset(tree, &old, new));
+
+	return (true);
 }
 
 /*
