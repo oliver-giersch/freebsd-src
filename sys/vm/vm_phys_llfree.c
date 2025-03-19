@@ -157,6 +157,8 @@ static void vm_pcpu_tree_revert(union vm_pcpu_tree *local,
     union vm_pcpu_tree old, uint16_t pages);
 static bool vm_pcpu_tree_unreserve(union vm_pcpu_tree *local,
     union vm_pcpu_tree *old);
+static vm_pgidx_t vm_pcpu_tree_steal(int cpu_id, int domain, uint8_t order,
+    uint16_t pages);
 
 static inline union vm_pgtree vm_pgtree_load(const union vm_pgtree *tree);
 static inline int vm_pgtree_fcmpset(union vm_pgtree *tree, union vm_pgtree *old,
@@ -173,9 +175,14 @@ static vm_pgidx_t vm_pgtree_alloc_search_all(unsigned all_idx, unsigned len,
 static vm_pgidx_t vm_pgtree_alloc_search_neighbors_constrained(
     uint32_t neighbors_idx, uint32_t skip_idx, uint8_t order, uint16_t pages,
     uint16_t *reserved_pages, uint16_t min, uint16_t max);
-static inline vm_pgidx_t vm_pgtree_alloc_search(unsigned tree_idx,
+static vm_pgidx_t vm_pgtree_alloc_search_all_constrained(unsigned all_idx,
+    unsigned len, unsigned skip_idx, uint8_t order, uint16_t pages,
+    uint16_t *reserved_pages, uint16_t min, uint16_t max);
+static vm_pgidx_t vm_pgtree_alloc_search(unsigned tree_idx,
     uint8_t order, uint16_t pages, uint16_t *reserved_pages, uint16_t min,
     uint16_t max);
+static inline vm_pgidx_t vm_pgtree_alloc_search_order(unsigned tree_idx,
+    uint8_t order, uint16_t pages);
 static vm_pgidx_t vm_pgtree_alloc_search_order_0to9(unsigned tree_idx,
     uint8_t order, uint16_t pages);
 static vm_pgidx_t vm_pgtree_alloc_search_order_10to12(unsigned tree_idx,
@@ -513,8 +520,7 @@ release:
 	vm_pgidx_t pg;
  
 	tree_idx = vm_pcpu_tree_get_tree(old);
-	// FIXME: Oh noo ... we don't need to reserve the tree first here ...
-	pg = vm_pgtree_alloc_search(tree_idx, order, pages);
+	pg = vm_pgtree_alloc_search_order(tree_idx, order, pages);
 	if (pg == invalid_pgidx) {
 		vm_pcpu_tree_revert(local, old, pages);
 		return (invalid_pgidx);
@@ -574,6 +580,27 @@ vm_pcpu_tree_unreserve(union vm_pcpu_tree *local, union vm_pcpu_tree *old)
 	} while (vm_pcpu_tree_fcmpset(local, old, new));
 
 	return (true);
+}
+
+static vm_pgidx_t
+vm_pcpu_tree_steal(int cpu_id, int domain, uint8_t order, uint16_t pages)
+{
+	int cpu;
+	union vm_pcpu_tree *remote, old;
+	union vm_pgtree *tree;
+
+	CPU_FOREACH(cpu) {
+		if (cpu == curcpu)
+			continue;
+		remote = DPCPU_ID_PTR(cpu, reserved_tree[domain]);
+		old = vm_pcpu_tree_load(remote);
+		if (vm_pcpu_tree_unreserve(remote, &old)) {
+			tree = &pgtrees[vm_pcpu_tree_get_tree(old)];
+			/* Try stealing the tree: only if old.free + tree.free is sufficient,
+			* otherwise, just add the stolen pages to the tree and continue*/
+			vm_pgtree_unreserve(tree, old.free);
+		}
+	}
 }
 
 static inline union vm_pgtree
@@ -643,15 +670,28 @@ static vm_pgidx_t
 vm_pgtree_alloc_search_all(unsigned all_idx, unsigned len, unsigned skip_idx,
     uint8_t order, uint16_t pages, uint16_t *reserved_pages)
 {
-	union vm_pgtree *tree;
+	uint16_t min, max;
 	vm_pgidx_t pg;
 
-	for (unsigned i = 0; i < len; i++) {
-		tree = &all[i];
-		if (tree >= skip && tree < &skip[VM_PGTREE_NEIGHBORS])
-			continue;
-		*reserved_pages = vm_pgtree_reserve(tree, uint16_t min, uint16_t max, uint16_t pages)
-	}
+	CRITICAL_ASSERT(curthread);
+
+	min = VM_PGTREE_ALMOST_EMPTY;
+	max = VM_PGTREE_ALMOST_FULL;
+
+	pg = vm_pgtree_alloc_search_all_constrained(all_idx, len, skip_idx,
+	    order, pages, reserved_pages, min, max);
+	if (pg != invalid_pgidx)
+		return (pg);
+
+	pg = vm_pgtree_alloc_search_all_constrained(all_idx, len, skip_idx,
+	    order, pages, reserved_pages, min, 0);
+	if (pg != invalid_pgidx)
+		return (pg);
+
+	pg = vm_pgtree_alloc_search_all_constrained(all_idx, len, skip_idx,
+	    order, pages, reserved_pages, 0, 0);
+	if (pg != invalid_pgidx)
+		return (pg);
 
 	return (invalid_pgidx);
 }
@@ -665,8 +705,8 @@ vm_pgtree_alloc_search_neighbors_constrained(unsigned neighbors_idx,
 	unsigned last;
 
 	/*
-	 * Check all trees in the direct neighborhood of the previously reserved
-	 * tree.
+	 * Check all trees in the direct neighborhood of the previously
+	 * reserved tree.
 	 */
 	last = neighbors_idx + VM_PGTREE_NEIGHBORS;
 	for (unsigned tree_idx = neighbors_idx; tree_idx < last; tree_idx++) {
@@ -706,7 +746,7 @@ vm_pgtree_alloc_search_all_constrained(unsigned all_idx, unsigned len,
 	return (invalid_pgidx);
 }
 
-static inline vm_pgidx_t
+static vm_pgidx_t
 vm_pgtree_alloc_search(unsigned tree_idx, uint8_t order, uint16_t pages,
     uint16_t *reserved_pages, uint16_t min, uint16_t max)
 {
@@ -731,13 +771,23 @@ vm_pgtree_alloc_search(unsigned tree_idx, uint8_t order, uint16_t pages,
 	 * Upon failure to find a suitable run, free the un-reserve the
 	 * the tree again.
 	 */
-	pg = (order <= 9)
-	    ? vm_pgtree_alloc_search_order_0to9(tree_idx, order, pages)
-	    : vm_pgtree_alloc_search_order_10to12(tree_idx, order);
+	pg = vm_pgtree_alloc_search_order(tree_idx, order, pages);
 	if (pg == invalid_pgidx) {
 		vm_pgtree_unreserve(tree, pages + *reserved_pages);
 		return (invalid_pgidx);
 	}
+
+	return (pg);
+}
+
+static inline vm_pgidx_t
+vm_pgtree_alloc_search_order(unsigned tree_idx, uint8_t order, uint16_t pages)
+{
+	vm_pgidx_t pg;
+
+	pg = (order <= 9)
+	    ? vm_pgtree_alloc_search_order_0to9(tree_idx, order, pages)
+	    : vm_pgtree_alloc_search_order_10to12(tree_idx, order);
 
 	return (pg);
 }
