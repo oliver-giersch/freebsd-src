@@ -158,7 +158,7 @@ static void vm_pcpu_tree_revert(union vm_pcpu_tree *local,
 static bool vm_pcpu_tree_unreserve(union vm_pcpu_tree *local,
     union vm_pcpu_tree *old);
 static vm_pgidx_t vm_pcpu_tree_steal(int cpu_id, int domain, uint8_t order,
-    uint16_t pages);
+    uint16_t pages, uint16_t *reserved_pages);
 
 static inline union vm_pgtree vm_pgtree_load(const union vm_pgtree *tree);
 static inline int vm_pgtree_fcmpset(union vm_pgtree *tree, union vm_pgtree *old,
@@ -191,6 +191,8 @@ static uint16_t vm_pgtree_reserve(union vm_pgtree *tree, uint16_t pages,
     uint16_t min, uint16_t max);
 static vm_pgidx_t vm_pgtree_alloc(union vm_pgtree *tree);
 static void vm_pgtree_unreserve(union vm_pgtree *tree, uint16_t pages);
+static int vm_pgtree_steal(union vm_pgtree *tree, uint16_t pages,
+    uint16_t stolen_pages);
 static inline union vm_pgcount vm_pgcount_load(
     volatile union vm_pgcount *count);
 static inline int vm_pgcount_fcmpset(volatile union vm_pgcount *count,
@@ -308,7 +310,7 @@ vm_phys_domain_alloc_search(struct vm_phys_domain *domain, uint8_t order,
 	pg = vm_pgtree_alloc_search_all(all_idx, len, neighbors_idx, order,
 	    pages, reserved_pages);
 	if (pg != invalid_pgidx)
-		return (pg);
+		return (pg); // FIXME: what about reserved pages? must be added to local free count!!
 
 	/*
 	 * Unreserve all CPU reserved trees.
@@ -583,24 +585,63 @@ vm_pcpu_tree_unreserve(union vm_pcpu_tree *local, union vm_pcpu_tree *old)
 }
 
 static vm_pgidx_t
-vm_pcpu_tree_steal(int cpu_id, int domain, uint8_t order, uint16_t pages)
+vm_pcpu_tree_steal(int cpu_id, int domain, uint8_t order, uint16_t pages,
+    uint16_t *reserved_pages)
 {
-	int cpu;
+	int cpu, res;
 	union vm_pcpu_tree *remote, old;
 	union vm_pgtree *tree;
+	unsigned tree_idx, stolen_pages;
+	vm_pgidx_t pg;
 
 	CPU_FOREACH(cpu) {
 		if (cpu == curcpu)
 			continue;
+
+		/*
+		 * Force the remote PCPU local tree to be unreserved.  This may
+		 * fail due to a race with any local operation of that CPU or
+		 * because of a concurrent steal attempt.
+		 */
 		remote = DPCPU_ID_PTR(cpu, reserved_tree[domain]);
 		old = vm_pcpu_tree_load(remote);
-		if (vm_pcpu_tree_unreserve(remote, &old)) {
-			tree = &pgtrees[vm_pcpu_tree_get_tree(old)];
-			/* Try stealing the tree: only if old.free + tree.free is sufficient,
-			* otherwise, just add the stolen pages to the tree and continue*/
-			vm_pgtree_unreserve(tree, old.free);
+		if (!vm_pcpu_tree_unreserve(remote, &old))
+			continue;
+
+		/*
+		 * After the PCPU tree has been reserved, its acquired pages
+		 * need to be released back to the global tree.  In the same
+		 * step we attempt to execute our own allocation request.
+		 * If the total (synced) free count of the tree is insufficient
+		 * to serve the allocation request, the tree is unreserved and
+		 * all previously reserved pages are released to it.  Otherwise,
+		 * the tree remains reserved (now for the current CPU) and its
+		 * entire free count is acquired and stored in `reserved_pages`.
+		 */
+		tree_idx = vm_pcpu_tree_get_tree(old);
+		tree = &pgtrees[tree_idx];
+		stolen_pages = old.free;
+		res = vm_pgtree_steal(tree, pages, stolen_pages);
+		if (res == -1)
+			continue;
+
+		/*
+		 * Finally, the allocation request has to be served by the
+		 * corresponding subcounts and page sets.  This step may yet
+		 * fail, in which case the tree must be unreserved and all
+		 * acquired pages be released back to it.
+		 */
+		*reserved_pages = (uint16_t)res;
+		pg = vm_pgtree_alloc_search_order(tree_idx, order, pages);
+		if (pg == invalid_pgidx) {
+			vm_pgtree_unreserve(tree, pages + *reserved_pages);
+			continue;
 		}
+
+		return (pg);
 	}
+
+	return (invalid_pgidx);
 }
 
 static inline union vm_pgtree
@@ -969,6 +1010,45 @@ vm_pgtree_unreserve(union vm_pgtree *tree, uint16_t pages)
 		new.free += pages;
 		new.reserved = false;
 	} while (vm_pgtree_fcmpset(tree, &old, new));
+}
+
+/*
+ * Steals the reservation from the tree and attempts to reserve a number of
+ * pages for allocation.
+ *
+ * The caller must previously have unreserved the corresponding PCPU
+ * local-reserved tree and acquired the free count stored within and pass
+ * this to this function.
+ *
+ * If the allocation is successful, the tree remains in a reserved state and the
+ * number of pages stolen from the (global) tree (between 0 and 2^15 - 1) minus
+ * the pages requested for the allocation is returned.
+ *
+ * If no allocation was possible, the tree is unreserved, all (locally)
+ * stolen pages are released to the tree and -1 is returned.
+ */
+static int
+vm_pgtree_steal(union vm_pgtree *tree, uint16_t pages, uint16_t stolen_pages)
+{
+	union vm_pgtree old, new;
+
+	old = vm_pgtree_load(tree);
+	do {
+		KASSERT(old.reserved,
+		    ("%s: unexpected tree %p not reserved", __func__, tree));
+		new = old;
+		if (old.free + stolen_pages >= pages)
+			old.free = 0;
+		else {
+			old.free += stolen_pages;
+			old.reserved = false;
+		}
+	} while (vm_pgtree_fcmpset(tree, &old, new));
+
+	if (old.reserved)
+		return (old.free + stolen_pages - pages);
+	else
+		return (-1);
 }
 
 static inline bool
