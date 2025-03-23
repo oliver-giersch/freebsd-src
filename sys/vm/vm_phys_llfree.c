@@ -4,6 +4,7 @@
 #include <sys/proc.h>
 #include <sys/smp.h>
 #include <sys/domainset.h>
+#include <sys/kernel.h>
 
 #include <vm/vm.h>
 #include <vm/vm_param.h>
@@ -17,6 +18,7 @@
 #include <machine/vmparam.h>
 
 #define invalid_pgidx (vm_pgidx_t)-1
+#define pgidx_mask (((vm_pgidx_t)1 << 48) - 1)
 
 typedef uint64_t vm_pgset_t;
 typedef uint64_t vm_pgidx_t;
@@ -49,6 +51,8 @@ struct vm_phys_domain {
 	uint32_t start_tree, end_tree;
 	uint8_t start_seg, end_seg;
 	domainid_t id;
+	// pointer to pgtrees instead of global?
+	// pointer to pgcounts and pgsets instead of global?
 };
 
 union vm_pgtree {
@@ -68,7 +72,7 @@ _Static_assert(sizeof(union vm_pgtree) == sizeof(uint16_t),
 
 union vm_pcpu_tree {
 	struct {
-		uint64_t	last_pgidx : 48;
+		vm_pgidx_t	last_pgidx : 48;
 		uint16_t	free       : VM_PGTREE_BITS;
 		bool		reserved   : 1; 
 	} __packed;
@@ -121,6 +125,28 @@ static union vm_pgtree *pgtrees;
 
 DPCPU_DEFINE_STATIC(union vm_pcpu_tree, reserved_tree[MAXMEMDOM]);
 
+struct vm_phys_alloc_args {
+	uint16_t pages;
+	vm_paddr_t low;
+	vm_paddr_t high;
+	vm_align_t alignment;
+	vm_paddr_t boundary;
+};
+
+static inline bool
+vm_pgidx_is_valid(vm_pgidx_t pg)
+{
+	return ((pg & ~pgidx_mask) == 0);
+}
+
+static inline uint8_t
+vm_page_order(u_long pages)
+{
+	uint8_t order;
+	order = flsl(pages) - 1;
+	return powerof2(pages) ? order : order + 1;
+}
+
 /*
  * Allocates 2^O free physical pages.
  */
@@ -128,33 +154,32 @@ static vm_pgidx_t vm_phys_domain_alloc(struct vm_phys_domain *domain,
     uint8_t order);
 static vm_pgidx_t vm_phys_domain_alloc_search(struct vm_phys_domain *domain,
     uint8_t order, uint16_t pages, union vm_pcpu_tree *local,
-    uint16_t *reserved_pages);
-static vm_pgidx_t vm_phys_alloc_domain_contig(struct vm_phys_domain *domain,
-    uint16_t pages, vm_paddr_t low, vm_paddr_t high, vm_align_t alignment,
-    vm_paddr_t boundary);
+    union vm_pcpu_tree *old, uint16_t *reserved_pages);
+static vm_pgidx_t vm_phys_domain_alloc_contig(struct vm_phys_domain *domain,
+    const struct vm_phys_alloc_args *args);
 static vm_pgidx_t vm_phys_domain_alloc_search_all(
     const struct vm_phys_domain *domain, uint32_t neighbors_idx,
     uint32_t skip_idx, uint8_t order, uint16_t pages, uint16_t *reserved_pages);
-
-/*static union vm_pgtree *vm_phys_domain_search_tree(
-    struct vm_phys_domain *domain, union vm_pcpu_tree *local,
-    union vm_pcpu_tree old, uint16_t pages);*/
 
 static inline unsigned vm_pcpu_tree_get_tree(union vm_pcpu_tree local);
 static inline union vm_pcpu_tree vm_pcpu_tree_load(
     const union vm_pcpu_tree *local);
 static inline int vm_pcpu_tree_fcmpset(union vm_pcpu_tree *local,
     union vm_pcpu_tree *old, union vm_pcpu_tree new);
-static vm_pgidx_t vm_pcpu_tree_alloc(union vm_pcpu_tree *local, uint8_t order,
-    uint16_t pages);
-static bool vm_pcpu_tree_acquire_pgs(union vm_pcpu_tree *local,
+static inline union vm_pcpu_tree vm_pcpu_tree_swap(union vm_pcpu_tree *local,
+    union vm_pcpu_tree new);
+static vm_pgidx_t vm_pcpu_tree_alloc(union vm_pcpu_tree *local,
+    union vm_pcpu_tree *old, uint8_t order, uint16_t pages);
+static bool vm_pcpu_tree_acquire(union vm_pcpu_tree *local,
     union vm_pcpu_tree *old, uint16_t pages);
 static bool vm_pcpu_tree_alloc_sync(union vm_pcpu_tree *local,
     union vm_pcpu_tree old_local, uint16_t wanted_pgs);
-static vm_pgidx_t vm_pcpu_tree_alloc_search(union vm_pcpu_tree *local,
-    union vm_pcpu_tree old, uint8_t order, uint16_t pages);
-static void vm_pcpu_tree_revert(union vm_pcpu_tree *local,
-    union vm_pcpu_tree old, uint16_t pages);
+static void vm_pcpu_tree_release(union vm_pcpu_tree *local,
+    union vm_pcpu_tree *old, uint16_t pages);
+static void vm_pcpu_tree_update_pgidx(union vm_pcpu_tree *local,
+    union vm_pcpu_tree *old, vm_pgidx_t pg);
+static void vm_pcpu_tree_reserve(union vm_pcpu_tree *local, vm_pgidx_t pg,
+    uint16_t pages);
 static bool vm_pcpu_tree_unreserve(union vm_pcpu_tree *local,
     union vm_pcpu_tree *old);
 static vm_pgidx_t vm_pcpu_tree_steal(int cpu_id, int domain, uint8_t order,
@@ -189,10 +214,9 @@ static vm_pgidx_t vm_pgtree_alloc_search_order_10to12(unsigned tree_idx,
     uint8_t order);
 static uint16_t vm_pgtree_reserve(union vm_pgtree *tree, uint16_t pages,
     uint16_t min, uint16_t max);
-static vm_pgidx_t vm_pgtree_alloc(union vm_pgtree *tree);
 static void vm_pgtree_unreserve(union vm_pgtree *tree, uint16_t pages);
-static int vm_pgtree_steal(union vm_pgtree *tree, uint16_t pages,
-    uint16_t stolen_pages);
+static bool vm_pgtree_steal(union vm_pgtree *tree, uint16_t pages,
+    uint16_t stolen_pages, uint16_t *reserved_pages);
 static inline union vm_pgcount vm_pgcount_load(
     volatile union vm_pgcount *count);
 static inline int vm_pgcount_fcmpset(volatile union vm_pgcount *count,
@@ -233,25 +257,80 @@ static inline void vm_pgset_free(vm_pgidx_t pg);
 
 static inline bool is_aligned(void *ptr, uint32_t alignment);
 
+struct vm_page *
+_vm_phys_alloc_contig(int domain, u_long pages, vm_paddr_t low, vm_paddr_t high,
+    vm_align_t alignment, vm_paddr_t boundary)
+{
+	struct vm_phys_domain *dom;
+	struct vm_phys_alloc_args args;
+	vm_pgidx_t pg;
+
+	KASSERT(0 < pages && pages <= (1 << 15),
+	    ("%s: invalid page count %lu", __func__, pages));
+
+	dom = &domains[domain];
+	if (low >= high || high <= dom->start_addr || dom->end_addr <= low)
+		return (NULL);
+
+	args.pages = (uint16_t)pages;
+	args.low = low;
+	args.high = high;
+	args.alignment = alignment;
+	args.boundary = boundary;
+
+	if ((pg = vm_phys_domain_alloc_contig(dom, &args)) == invalid_pgidx)
+		return (NULL);
+
+	panic("...");
+}
+
+void
+vm_phys_free_pages(struct vm_page *m, int pool, int order)
+{
+	// FIXME: instead of segind/poolind/order, store pgidx?
+	vm_paddr_t pa;
+	vm_pgidx_t pg;
+
+	KASSERT(order < VM_NFREEORDER,
+	    ("%s: order %d is out of range", __func__, order));
+
+	pa = VM_PAGE_TO_PHYS(m);
+	pg = pa / PAGE_SIZE;
+
+	/* flip the right bit in (global) pgsets */
+	/* add (1 << order) to pgcounts */
+	/* add (1 << order) to pgtree */
+	/* add to PCPU free history */
+}
+
+void
+vm_phys_free_contig(struct vm_page *m, int pool, u_long pages)
+{
+	// not required to be order 2!
+}
+
 static vm_pgidx_t
 vm_phys_domain_alloc(struct vm_phys_domain *domain, uint8_t order)
 {
-	union vm_pcpu_tree *local;
+	union vm_pcpu_tree *local, old;
 	uint16_t pages, reserved_pages;
 	vm_pgidx_t pg;
 
 	pages = 1 << order;
+
+	critical_enter();
+	local = DPCPU_PTR(reserved_tree[domain->id]);
 
 	/*
 	 * Try to allocate the desired pages from the current CPU's reserved
 	 * tree.  If allocating sufficient pages fails, unreserve the current
 	 * tree before trying to find and reserve another one.
 	 */
-	critical_enter();
-	local = DPCPU_PTR(reserved_tree[domain->id]);
-	pg = vm_pcpu_tree_alloc(local, order, pages);
-	if (pg != invalid_pgidx)
+	pg = vm_pcpu_tree_alloc(local, &old, order, pages);
+	if (pg != invalid_pgidx) {
+		vm_pcpu_tree_update_pgidx(local, &old, pg);
 		goto exit;
+	}
 
 	/*
 	 * Try to find another tree with sufficient free pages, reserve it and
@@ -261,13 +340,10 @@ vm_phys_domain_alloc(struct vm_phys_domain *domain, uint8_t order)
 	 * is also marked as reserved and its free count set, otherwise this is
 	 * reverted.
 	 */
-	pg = vm_phys_domain_alloc_search(domain, order, pages, local,
+	pg = vm_phys_domain_alloc_search(domain, order, pages, local, &old,
 	    &reserved_pages);
-	if (pg != invalid_pgidx) {
-		// FIXME: calculate tree from pg, reserve it locally, uh noh, 
-		// dont no nomo how many pgs were "stolen" ...
-		// best to return reserved_pages in an out parameter I s'pose
-	}
+	if (pg != invalid_pgidx)
+		vm_pcpu_tree_reserve(local, pg, reserved_pages);
 
 exit:
 	critical_exit();
@@ -276,18 +352,22 @@ exit:
 
 static vm_pgidx_t
 vm_phys_domain_alloc_search(struct vm_phys_domain *domain, uint8_t order,
-    uint16_t pages, union vm_pcpu_tree *local, uint16_t *reserved_pages)
+    uint16_t pages, union vm_pcpu_tree *local, union vm_pcpu_tree *old,
+    uint16_t *reserved_pages)
 {
-	union vm_pcpu_tree old, *remote;
 	unsigned tree_idx, neighbors_idx, all_idx, len;
 	vm_pgidx_t pg;
-	int cpu;
 
 	CRITICAL_ASSERT(curthread);
 
-	old = vm_pcpu_tree_load(local);
-	if (old.reserved) {
-		tree_idx = vm_pcpu_tree_get_tree(old);
+	/*
+	 * If there was a PCPU reserved tree but with insufficient free pages
+	 * for the allocation request, we can search the cache line neighborhood
+	 * of that tree instead of doing a full search over all trees in the
+	 * domain right away.
+	 */
+	if (old->reserved) {
+		tree_idx = vm_pcpu_tree_get_tree(*old);
 		neighbors_idx = vm_pgtree_get_neighbors(tree_idx);
 
 		/*
@@ -300,7 +380,7 @@ vm_phys_domain_alloc_search(struct vm_phys_domain *domain, uint8_t order,
 		if (pg != invalid_pgidx)
 			return (pg);
 	} else
-		neighbors_idx = (uint32_t)-1;
+		neighbors_idx = (unsigned)-1;
 
 	/*
 	 * Search for any free tree in the domain.
@@ -310,29 +390,19 @@ vm_phys_domain_alloc_search(struct vm_phys_domain *domain, uint8_t order,
 	pg = vm_pgtree_alloc_search_all(all_idx, len, neighbors_idx, order,
 	    pages, reserved_pages);
 	if (pg != invalid_pgidx)
-		return (pg); // FIXME: what about reserved pages? must be added to local free count!!
+		return (pg);
 
 	/*
-	 * Unreserve all CPU reserved trees.
-	 * FIXME: try allocating from stolen tree immediately
+	 * Unreserve other CPU reserved trees and try to steal from them.
 	 */
-	 CPU_FOREACH(cpu) {
-		if (cpu == curcpu)
-			continue;
-		remote = DPCPU_ID_PTR(cpu, reserved_tree[domain->id]);
-		old = vm_pcpu_tree_load(remote);
-		if (vm_pcpu_tree_unreserve(remote, &old)) {
-			tree = &pgtrees[vm_pcpu_tree_get_tree(old)];
-			vm_pgtree_unreserve(tree, old.free);
-		}
-	}
-
-	return (invalid_pgidx);
+	pg = vm_pcpu_tree_steal(curcpu, domain->id, order, pages,
+	    reserved_pages);
+	return (pg);
 }
 
 static vm_pgidx_t
-vm_phys_alloc_domain_contig(struct vm_phys_domain *domain, uint16_t pages,
-    vm_paddr_t low, vm_paddr_t high, vm_align_t alignment, vm_paddr_t boundary)
+vm_phys_domain_alloc_contig(struct vm_phys_domain *domain,
+    const struct vm_phys_alloc_args *args)
 {
 	/*
 	 * - restrict to max O=15?
@@ -340,29 +410,31 @@ vm_phys_alloc_domain_contig(struct vm_phys_domain *domain, uint16_t pages,
 	 * - restrict range of pgsets accordingly
 	 * - search for a suitable range, i.e. a run of free bits
 	 * - then reserve the associated pgtree and allocate from it
+	 *
+	 * - calculate next higher order
+	 * - allocate N full trees (non-reserved, full count, maybe unreserve)
+	 * - determine a range of valid trees min/max tree_idx, adjust for
+	 *   alignment/boundary, determine 
+	 *   
 	 */
 	unsigned i;
+	uint8_t order;
 	struct vm_phys_seg *seg;
 	vm_paddr_t range[2];
 
-	KASSERT(0 < pages && pages <= (1 << 15),
-	    ("%s: invalid page count %u", __func__, pages));
-
-	if (low >= high || high <= domain->start_addr
-	    || domain->end_addr <= low)
-		return (invalid_pgidx);
+	order = vm_page_order(args->pages);
 
 	for (i = domain->end_seg - 1; i >= domain->start_seg; i--) {
 		seg = &phys_segments.array[i];
-		if (seg->start >= high)
+		if (seg->start >= args->high)
 			break;
-		if (low >= seg->end)
+		if (args->low >= seg->end)
 			continue;
 
-		range[0] = (low <= seg->start) ? seg->start : low;
-		range[1] = (high <= seg->end) ? high : seg->end;
+		range[0] = (args->low <= seg->start) ? seg->start : args->low;
+		range[1] = (args->high <= seg->end) ? args->high : seg->end;
 
-		if (range[1] - range[0] < ptoa(pages))
+		if (range[1] - range[0] < ptoa(args->pages))
 			continue;
 		//order 0-12: regular
 		//order 12-_: allocate consecutive blocks of full O15 trees
@@ -397,26 +469,48 @@ vm_pcpu_tree_fcmpset(union vm_pcpu_tree *local, union vm_pcpu_tree *old,
 	return (atomic_fcmpset_64(&local->bits, &old->bits, new.bits));
 }
 
-static vm_pgidx_t
-vm_pcpu_tree_alloc(union vm_pcpu_tree *local, uint8_t order, uint16_t pages)
+static inline union vm_pcpu_tree
+vm_pcpu_tree_swap(union vm_pcpu_tree *local, union vm_pcpu_tree new)
 {
 	union vm_pcpu_tree old;
+
+	old.bits = atomic_swap_64(&local->bits, new.bits);
+
+	return (old);
+}
+
+static vm_pgidx_t
+vm_pcpu_tree_alloc(union vm_pcpu_tree *local, union vm_pcpu_tree *old,
+    uint8_t order, uint16_t pages)
+{
 	union vm_pgtree *tree;
+	unsigned tree_idx;
 	vm_pgidx_t pg;
 
 	CRITICAL_ASSERT(curthread);
 
-	old = vm_pcpu_tree_load(local);
-	if (vm_pcpu_tree_acquire_pgs(local, &old, pages)) {
-		pg = vm_pcpu_tree_alloc_search(local, old, order, pages);
+	/*
+	 * Try to allocate pages from the currently CPU reserved tree.
+	 */
+	*old = vm_pcpu_tree_load(local);
+	if (vm_pcpu_tree_acquire(local, old, pages)) {
+		// FIXME: try to do a last_pgidx allocation
+		tree_idx = vm_pcpu_tree_get_tree(*old);
+		pg = vm_pgtree_alloc_search_order(tree_idx, order, pages);
 		if (pg != invalid_pgidx)
 			return (pg);
+		vm_pcpu_tree_release(local, old, pages);
 	}
 
-	if (old.reserved) {
-		if (vm_pcpu_tree_unreserve(local, &old)) {
-			tree = &pgtrees[vm_pcpu_tree_get_tree(old)];
-			vm_pgtree_unreserve(tree, old.free);
+	/*
+	 * If allocation from the PCPU tree failed (e.g., because of
+	 * insufficient pages) but it was reserved, unreserve that tree before
+	 * beginning to look for another.
+	 */
+	if (old->reserved) {
+		if (vm_pcpu_tree_unreserve(local, old)) {
+			tree = &pgtrees[vm_pcpu_tree_get_tree(*old)];
+			vm_pgtree_unreserve(tree, old->free);
 		}
 	}
 
@@ -424,12 +518,13 @@ vm_pcpu_tree_alloc(union vm_pcpu_tree *local, uint8_t order, uint16_t pages)
 }
 
 static bool
-vm_pcpu_tree_acquire_pgs(union vm_pcpu_tree *local, union vm_pcpu_tree *old,
+vm_pcpu_tree_acquire(union vm_pcpu_tree *local, union vm_pcpu_tree *old,
     uint16_t pages)
 {
 	union vm_pcpu_tree new;
 
 	CRITICAL_ASSERT(curthread);
+
 	do {
 		/*
 		 * The local reservation may have been broken up by another
@@ -508,31 +603,8 @@ release:
 	return (0);
 }
 
-/*
- * Searches the CPU reserved page tree for a run of free pages for the requested
- * order.
- *
- * Returns the index of the first page on success.
- */
- static vm_pgidx_t
- vm_pcpu_tree_alloc_search(union vm_pcpu_tree *local, union vm_pcpu_tree old,
-     uint8_t order, uint16_t pages)
- {
-	unsigned tree_idx;
-	vm_pgidx_t pg;
- 
-	tree_idx = vm_pcpu_tree_get_tree(old);
-	pg = vm_pgtree_alloc_search_order(tree_idx, order, pages);
-	if (pg == invalid_pgidx) {
-		vm_pcpu_tree_revert(local, old, pages);
-		return (invalid_pgidx);
-	}
- 
-	return (pg);
-}
-
 static void
-vm_pcpu_tree_revert(union vm_pcpu_tree *local, union vm_pcpu_tree old,
+vm_pcpu_tree_release(union vm_pcpu_tree *local, union vm_pcpu_tree *old,
     uint16_t pages)
 {
 	union vm_pcpu_tree new;
@@ -546,17 +618,50 @@ vm_pcpu_tree_revert(union vm_pcpu_tree *local, union vm_pcpu_tree old,
 		 * the (reverted) free pages need to be added to the global free
 		 * tree's free count.
 		 */
-		if (!old.reserved)
+		if (!old->reserved)
 			break;
-		new = old;
+		new = *old;
 		new.free += pages;
 
-		if (!vm_pcpu_tree_fcmpset(local, &old, new))
+		if (!vm_pcpu_tree_fcmpset(local, old, new))
 			return;
 	}
 
-	tree = &pgtrees[vm_pcpu_tree_get_tree(old)];
+	tree = &pgtrees[vm_pcpu_tree_get_tree(*old)];
 	(void)vm_pgtree_fetchadd(tree, pages);
+}
+
+static void
+vm_pcpu_tree_update_pgidx(union vm_pcpu_tree *local, union vm_pcpu_tree *old,
+    vm_pgidx_t pg)
+{
+	union vm_pcpu_tree new;
+
+	KASSERT(vm_pgidx_is_valid(pg), ("%s: invalid pg %lu", __func__, pg));
+	KASSERT(old->reserved, ("%s: previous PCPU not reserved", __func__));
+
+	do {
+		if (!old->reserved)
+			return;
+		new = *old;
+		new.last_pgidx = pg;
+	} while (vm_pcpu_tree_fcmpset(local, old, new));
+}
+
+static void
+vm_pcpu_tree_reserve(union vm_pcpu_tree *local, vm_pgidx_t pg, uint16_t pages)
+{
+	union vm_pcpu_tree old, new;
+
+	KASSERT(vm_pgidx_is_valid(pg), ("%s: invalid page %lu", __func__, pg));
+
+	new.bits = 0;
+	new.last_pgidx = pg;
+	new.free = pages;
+	new.reserved = true;
+
+	old = vm_pcpu_tree_swap(local, new);
+	KASSERT(!old.reserved, ("%s: PCPU tree already reserved", __func__));
 }
 
 static bool
@@ -565,7 +670,6 @@ vm_pcpu_tree_unreserve(union vm_pcpu_tree *local, union vm_pcpu_tree *old)
 	union vm_pcpu_tree new;
 
 	CRITICAL_ASSERT(curthread);
-	//sKASSERT(old->reserved, ("%s: local tree not reserved", __func__));
 
 	do {
 		/*
@@ -588,14 +692,16 @@ static vm_pgidx_t
 vm_pcpu_tree_steal(int cpu_id, int domain, uint8_t order, uint16_t pages,
     uint16_t *reserved_pages)
 {
-	int cpu, res;
+	int cpu;
 	union vm_pcpu_tree *remote, old;
 	union vm_pgtree *tree;
 	unsigned tree_idx, stolen_pages;
 	vm_pgidx_t pg;
 
+	CRITICAL_ASSERT(curthread);
+
 	CPU_FOREACH(cpu) {
-		if (cpu == curcpu)
+		if (cpu == cpu_id)
 			continue;
 
 		/*
@@ -621,8 +727,8 @@ vm_pcpu_tree_steal(int cpu_id, int domain, uint8_t order, uint16_t pages,
 		tree_idx = vm_pcpu_tree_get_tree(old);
 		tree = &pgtrees[tree_idx];
 		stolen_pages = old.free;
-		res = vm_pgtree_steal(tree, pages, stolen_pages);
-		if (res == -1)
+
+		if (!vm_pgtree_steal(tree, pages, stolen_pages, reserved_pages))
 			continue;
 
 		/*
@@ -631,7 +737,6 @@ vm_pcpu_tree_steal(int cpu_id, int domain, uint8_t order, uint16_t pages,
 		 * fail, in which case the tree must be unreserved and all
 		 * acquired pages be released back to it.
 		 */
-		*reserved_pages = (uint16_t)res;
 		pg = vm_pgtree_alloc_search_order(tree_idx, order, pages);
 		if (pg == invalid_pgidx) {
 			vm_pgtree_unreserve(tree, pages + *reserved_pages);
@@ -858,8 +963,8 @@ vm_pgtree_alloc_search_order_0to9(unsigned tree_idx, uint8_t order,
 	 * the associated page sets, in which case the allocation needs to be
 	 * reverted.
 	 */
-	 if (offset == -1)
-	 return (invalid_pgidx);
+	if (offset == -1)
+		return (invalid_pgidx);
 
 	/*
 	 * Order 9 allocations don't require modification to the individual page
@@ -874,7 +979,7 @@ vm_pgtree_alloc_search_order_0to9(unsigned tree_idx, uint8_t order,
 	 * of the page sets.  Single page allocations (order 0) are guaranteed
 	 * to succeed, but larger ones (order 1 to 8) may fail and require to be
 	 * reverted.
-	*/
+	 */
 	set = &pgsets.sets[pgset_idx];
 	if (order == 0)
 		return ((pgset_idx + vm_pgset_alloc_order_0(set))
@@ -947,6 +1052,13 @@ vm_pgtree_alloc_search_order_10to12(unsigned tree_idx, uint8_t order)
 		return (invalid_pgidx);
 
 	return (treeset_idx + offset * VM_PGSET_COUNT);
+}
+
+static bool
+vm_pgtree_acquire_order_13_or_more(union vm_pgtree *tree, uint8_t order,
+    uint16_t pages)
+{
+	return (false);
 }
 
 static uint16_t
@@ -1027,8 +1139,9 @@ vm_pgtree_unreserve(union vm_pgtree *tree, uint16_t pages)
  * If no allocation was possible, the tree is unreserved, all (locally)
  * stolen pages are released to the tree and -1 is returned.
  */
-static int
-vm_pgtree_steal(union vm_pgtree *tree, uint16_t pages, uint16_t stolen_pages)
+static bool
+vm_pgtree_steal(union vm_pgtree *tree, uint16_t pages, uint16_t stolen_pages,
+    uint16_t *reserved_pages)
 {
 	union vm_pgtree old, new;
 
@@ -1045,10 +1158,11 @@ vm_pgtree_steal(union vm_pgtree *tree, uint16_t pages, uint16_t stolen_pages)
 		}
 	} while (vm_pgtree_fcmpset(tree, &old, new));
 
-	if (old.reserved)
-		return (old.free + stolen_pages - pages);
-	else
-		return (-1);
+	if (old.reserved) {
+		*reserved_pages = old.free + stolen_pages - pages;
+		return (true);
+	} else
+		return (false);
 }
 
 static inline bool
@@ -1084,6 +1198,7 @@ vm_pgcount_fcmpset(volatile union vm_pgcount *count, union vm_pgcount *old,
 	return (atomic_fcmpset_16(&count->bits, &old->bits, new.bits));
 }
 
+// rename to vm_pgcount_acquire
 static int
 vm_pgcount_alloc_search_order_0to9(union vm_pgcount counts[VM_PGTREE_SETS],
     uint16_t pages)
