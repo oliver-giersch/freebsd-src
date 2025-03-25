@@ -70,10 +70,10 @@ int vm_phys_avail_largest(void);
 vm_paddr_t vm_phys_avail_size(int i);
 void vm_phys_early_startup(void);
 void vm_phys_early_add_seg(vm_paddr_t start, vm_paddr_t end);
+void vm_phys_add_seg(vm_paddr_t start, vm_paddr_t end);
 vm_paddr_t vm_phys_early_alloc(int domain, size_t alloc_size);
 
 void vm_phys_init(void);
-void vm_phys_add_seg(vm_paddr_t start, vm_paddr_t end);
 void vm_phys_register_domains(int ndomains, struct mem_affinity *affinity,
     int *locality);
 
