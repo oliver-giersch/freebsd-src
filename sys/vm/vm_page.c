@@ -744,6 +744,8 @@ vm_page_startup(vm_offset_t vaddr)
 #endif
 	phys_avail[biggestone + 1] = new_end;
 
+	// XXX: vm_phys_preinit()? use vm_phys_early_alloc to allocate pgsets and so on
+
 	/*
 	 * Add physical memory segments corresponding to the available
 	 * physical pages.
