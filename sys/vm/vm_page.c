@@ -797,11 +797,15 @@ vm_page_startup(vm_offset_t vaddr)
 				startp = phys_avail[i + 1];
 				continue;
 			}
+
 			m = vm_phys_seg_paddr_to_vm_page(seg, startp);
-			for (endp = MIN(phys_avail[i], seg->end);
-			    startp < endp; startp += PAGE_SIZE, m++) {
+			endp = MIN(phys_avail[i], seg->end);
+
+			while (startp < endp) {
 				vm_page_init_page(m, startp, segind,
 				    VM_FREEPOOL_DEFAULT);
+				startp += PAGE_SIZE;
+				m++;
 			}
 		}
 

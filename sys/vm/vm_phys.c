@@ -78,7 +78,7 @@ _Static_assert(sizeof(long long) >= sizeof(vm_paddr_t),
     "vm_paddr_t too big for ffsll, flsll.");
 
 #ifdef NUMA
-struct mem_affinity __read_mostly *mem_affinity;
+const struct mem_affinity __read_mostly *mem_affinity;
 int __read_mostly *mem_locality;
 
 static int numa_disabled;
@@ -1012,7 +1012,7 @@ vm_phys_alloc_pages(int domain, int pool, int order)
  * within the given physical memory segment.
  */
 vm_page_t
-vm_phys_seg_paddr_to_vm_page(struct vm_phys_seg *seg, vm_paddr_t pa)
+vm_phys_seg_paddr_to_vm_page(const struct vm_phys_seg *seg, vm_paddr_t pa)
 {
 	KASSERT(pa >= seg->start && pa < seg->end,
 	    ("%s: pa %#jx is out of range", __func__, (uintmax_t)pa));
