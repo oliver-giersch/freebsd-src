@@ -59,6 +59,7 @@ vm_paddr_t dump_avail[PHYS_AVAIL_COUNT];
 struct {
 	struct vm_phys_seg array[VM_PHYSSEG_MAX];
 	unsigned len;
+	bool initialized;
 } phys_segments __read_mostly;
 
 struct {
@@ -67,7 +68,7 @@ struct {
 } phys_early_segments __read_mostly;
 
 #ifdef NUMA
-struct mem_affinity __read_mostly *mem_affinity;
+const struct mem_affinity __read_mostly *mem_affinity;
 int __read_mostly *mem_locality;
 #endif /* NUMA */
 
@@ -88,9 +89,8 @@ RB_HEAD(fict_tree, vm_phys_fictitious_seg) vm_phys_fictitious_tree =
 struct vm_phys_fictitious_seg {
 	RB_ENTRY(vm_phys_fictitious_seg) node;
 	/* Memory region data */
-	vm_paddr_t	start;
-	vm_paddr_t	end;
-	vm_page_t	first_page;
+	vm_paddr_t	start, end;
+	struct vm_page	*first_page;
 };
 
 RB_GENERATE_STATIC(fict_tree, vm_phys_fictitious_seg, node,
@@ -117,6 +117,8 @@ static int vm_phys_avail_split(vm_paddr_t pa, int i);
 #ifdef NUMA
 static int vm_phys_avail_find(vm_paddr_t pa);
 #endif /* NUMA */
+
+static void vm_phys_domain_init(vm_offset_t *va);
 
 int
 vm_phys_avail_largest(void)
@@ -330,36 +332,31 @@ vm_phys_seg_paddr_to_vm_page(const struct vm_phys_seg *seg, vm_paddr_t pa)
 }
 
 void
-vm_phys_preinit(void)
+vm_phys_init(vm_offset_t *va)
 {
-	// at this point, vm_phys_segs are not yet initialized!
-	// so we must use mem_affinity ... (for determining domains)
-	// vm_ndomains *can* be used!
-
+	/* Allocate memory for the physical page allocator. */
+	vm_phys_domain_init(va);
 
 	/*
+	 * Initialize the physical memory segments.
+	 *
 	 * Add physical memory segments corresponding to the available
 	 * physical pages.
 	 */
 	for (int i = 0; phys_avail[i + 1] != 0; i += 2)
 		vm_phys_add_seg(phys_avail[i], phys_avail[i + 1]);
+	phys_segments.initialized = true;
 
-	
-
-	return;
-}
-
-void
-vm_phys_init(void)
-{
-	return;
+	/*
+	 *
+	 */
 }
 
 static void
 vm_phys_create_seg(vm_paddr_t start, vm_paddr_t end)
 {
 #ifdef NUMA
-	struct mem_affinity *ma;
+	const struct mem_affinity *ma;
 
 	if (mem_affinity == NULL) {
 		vm_phys_create_seg_domain(start, end, 0);
@@ -393,15 +390,19 @@ vm_phys_create_seg_domain(vm_paddr_t start, vm_paddr_t end, int domain)
 {
 	struct vm_phys_seg *seg;
 
+	if (phys_segments.initialized)
+		panic("%s: must not create further segments after the physical "
+		    "memory allocator has been initialized", __func__);
 	if (domain < 0 || domain >= vm_ndomains)
 		panic("%s: invalid domain %d (max = %d)", __func__, domain,
 		    vm_ndomains);
-	if (vm_phys_nsegs >= VM_PHYSSEG_MAX)
+	if (phys_segments.len >= VM_PHYSSEG_MAX)
 		panic("%s: not enough storage for physical segments, "
 		    "increase VM_PHYSSEG_MAX", __func__);
 
-	seg = &vm_phys_segs[vm_phys_nsegs++];
-	while (seg > vm_phys_segs && seg[-1].start >= end) {
+	
+	seg = &phys_segments.array[phys_segments.len++];
+	while (seg > phys_segments.array && seg[-1].start >= end) {
 		*seg = *(seg - 1);
 		seg--;
 	}
@@ -410,10 +411,10 @@ vm_phys_create_seg_domain(vm_paddr_t start, vm_paddr_t end, int domain)
 	seg->end = end;
 	seg->domain = domain;
 
-	if (seg != vm_phys_segs && seg[-1].end > start)
+	if (seg != phys_segments.array && seg[-1].end > start)
 		panic("%s: overlapping physical segments: Current [%#jx,%#jx) "
 		    "at index %zu, previous [%#jx,%#jx)", __func__,
-		    (uintmax_t)start, (uintmax_t)end, seg - vm_phys_segs,
+		    (uintmax_t)start, (uintmax_t)end, seg - phys_segments.array,
 		    (uintmax_t)seg[-1].start, (uintmax_t)seg[-1].end);
 }
 
@@ -567,15 +568,12 @@ struct vm_pgset {
 
 /* 1 LLFree "instance" per domain. */
 struct vm_phys_domain {
-	vm_paddr_t start_addr, end_addr;
-	uint32_t start_tree, end_tree;
-	uint8_t start_seg, end_seg;
-	domainid_t id;
+	vm_paddr_t start, end;
 	union vm_pgtree *trees;
 	union vm_pgcount *counts;
 	struct vm_pgset *sets;
-	// pointer to pgtrees instead of global?
-	// pointer to pgcounts and pgsets instead of global?
+	uint64_t pages;
+	domainid_t id;
 };
 
 union vm_pgcount_2x {
@@ -630,7 +628,7 @@ vm_page_order(u_long pages)
 /*
  * Allocates 2^O free physical pages.
  */
-static void vm_phys_domain_init(void);
+
 static vm_pgidx_t vm_phys_domain_alloc(struct vm_phys_domain *domain,
     uint8_t order);
 static vm_pgidx_t vm_phys_domain_alloc_search(struct vm_phys_domain *domain,
@@ -729,6 +727,8 @@ static inline bool vm_pgcount_4x_alloc(union vm_pgcount counts[4],
     union vm_pgcount_4x *old);
 static void vm_pgcount_4x_revert(union vm_pgcount counts[4]);
 
+static void vm_pgset_init_partial(struct vm_pgset *set, uint16_t pages,
+    bool skip_front);
 static inline unsigned vm_pgset_alloc_order_0(struct vm_pgset *set);
 static inline int vm_pgset_alloc_order_1to5(struct vm_pgset *set,
     uint8_t order);
@@ -737,6 +737,9 @@ static inline int vm_pgset_alloc_order_6to8(struct vm_pgset *set,
 static inline void vm_pgset_free_order_0(struct vm_pgset *set, unsigned pg);
 static inline void vm_pgset_free(vm_pgidx_t pg);
 
+// XXX: remove this
+struct vm_page * _vm_phys_alloc_contig(int domain, u_long pages, vm_paddr_t low,
+    vm_paddr_t high, vm_align_t alignment, vm_paddr_t boundary);
 struct vm_page *
 _vm_phys_alloc_contig(int domain, u_long pages, vm_paddr_t low, vm_paddr_t high,
     vm_align_t alignment, vm_paddr_t boundary)
@@ -749,7 +752,7 @@ _vm_phys_alloc_contig(int domain, u_long pages, vm_paddr_t low, vm_paddr_t high,
 	    ("%s: invalid page count %lu", __func__, pages));
 
 	dom = &domains[domain];
-	if (low >= high || high <= dom->start_addr || dom->end_addr <= low)
+	if (low >= high || high <= dom->start || dom->end <= low)
 		return (NULL);
 
 	args.pages = (uint16_t)pages;
@@ -793,39 +796,60 @@ static void
 vm_phys_domain_init(vm_offset_t *va)
 {
 	const struct mem_affinity *ma;
+	vm_paddr_t pa0, start, end;
+	vm_pgidx_t pg_start, pg_end, pg_total;
+	int macount;
 	struct vm_phys_domain *domain;
-	vm_pgidx_t start, end;
 	uint64_t pgcount, treecount, setcount;
 	size_t alloc_size;
 	vm_paddr_t pa;
 
-	ma = NULL;
+	pa0 = first_page * PAGE_SIZE;
+	start = (vm_paddr_t)-1;
+	end = 0;
+	macount = 0;
+	pg_total = 0;
 
 	for (int i = 0; i < vm_ndomains; i++) {
 		for (int j = 0; mem_affinity[j].end != 0; j++) {
-			if (mem_affinity[j].domain != i)
-				continue;
 			ma = &mem_affinity[j];
-			break;
+			if (ma->domain != i)
+				continue;
+			if (ma->end <= pa0)
+				continue;
+			
+			if (ma->start < start)
+				start = ma->start;
+			if (ma->end > end)
+				end = ma->end;
 		}
 
-		if (ma == NULL)
-			panic("%s: failed to find mem_affinity for domain %d",
-			    __func__, i);
+		if (!macount)
+			continue;
 
-		start = atop(ma->start);
-		end = atop(ma->end);
-		if (start < first_page)
+		pg_start = atop(start);
+		pg_end = atop(end);
+		if (pg_start < first_page)
 			panic("%s: invalid page index %lu in domain %d",
-			    __func__, start, i);
+			    __func__, pg_start, i);
 
-		pgcount = end - start;
+		pgcount = pg_end - pg_start;
+		if (pgcount == 0)
+			continue;
+
 		treecount = pgcount / VM_PGTREE_COUNT;
 		setcount = pgcount / VM_PGSET_COUNT;
 
 		domain = &domains[i];
+		domain->start = start;
+		domain->end = end;
+		domain->pages = pgcount;
 		domain->id = (domainid_t)i;
 
+		/*
+		 * Allocate and map consecutive memory for the domain's pgtrees,
+		 * pgcounts and pgsets.
+		 */
 		alloc_size = round_page(sizeof(union vm_pgtree) * treecount);
 		pa = vm_phys_early_alloc(i, alloc_size);
 		domain->trees = (union vm_pgtree *)pmap_map(va, pa,
@@ -839,7 +863,124 @@ vm_phys_domain_init(vm_offset_t *va)
 		pa = vm_phys_early_alloc(i, alloc_size);
 		domain->counts = (union vm_pgcount *)pmap_map(va, pa,
 		    pa + alloc_size, VM_PROT_READ | VM_PROT_WRITE);
+		bzero(domain->counts, alloc_size);
+		KASSERT(
+		    is_aligned(domain->trees, _Alignof(union vm_pgcount_4x)),
+		    ("%s: invalid vm_pgcount alignment in domain %d",
+		    __func__, i));
+
+		alloc_size = round_page(sizeof(struct vm_pgset) * setcount);
+		pa = vm_phys_early_alloc(i, alloc_size);
+		domain->sets = (struct vm_pgset *)pmap_map(va, pa,
+		    pa + alloc_size, VM_PROT_READ | VM_PROT_WRITE);
+		/*
+		 * We must initially mark every page as allocated, before later
+		 * selectively marking the free ones based on what is available.
+		 */
+		memset(domain->sets, -1, alloc_size);
+		KASSERT(is_aligned(domain->sets, _Alignof(struct vm_pgset)),
+		    ("%s: invalid vm_pgset alignment in domain %d",
+		    __func__, i));
+
+		pg_total += pgcount;
 	}
+
+	if (pg_total != vm_page_array_size)
+		panic("%s: mismatch between vm_page_array size and "
+		    "vm_phys_domain page counts.", __func__);
+}
+
+// XXX: moveup
+static void
+vm_phys_domain_init_seg(struct vm_phys_domain *domain, const struct vm_phys_seg *seg);
+
+static void
+vm_phys_domain_init2(void)
+{
+	struct vm_phys_domain *domain;
+	const struct vm_phys_seg *seg;
+	vm_pgidx_t pg;
+	uint64_t set_idx, tree_idx;
+	unsigned pgcount;
+	uint16_t unaligned_set_pgs;
+
+	for (int i = 0; i < vm_ndomains; i++) {
+		domain = &domains[i];
+		for (int j = 0; j < phys_segments.len; j++) {
+			seg = &phys_segments.array[j];
+			if (domain->id != seg->domain)
+				continue;
+
+			KASSERT(seg->start >= domain->start,
+			    ("%s: ...", __func__));
+			KASSERT(seg->end <= domain->end,
+			    ("%s: ....", __func__));
+			pg = (seg->start - domain->start) / PAGE_SIZE;
+			set_idx = pg / VM_PGSET_COUNT;
+			if (pg & (VM_PGSET_COUNT - 1))
+				vm_pgset_init_partial(&domain->sets[set_idx], MAX(pgcount, VM_PGSET_COUNT), true);
+
+
+			tree_idx = pg / VM_PGTREE_COUNT;
+			pgcount = (seg->end - seg->start) / PAGE_SIZE;
+
+			// XXX: advance pg until set aligned
+
+			for (unsigned k = 0; k < pgcount; k++) {
+
+			}
+			// add free count to trees + counts!
+			// flip bits in sets!
+		}
+	}
+}
+
+static void
+vm_phys_domain_init_seg(struct vm_phys_domain *domain,
+    const struct vm_phys_seg *seg)
+{
+	vm_pgidx_t pg;
+	uint64_t pgcount;
+	unsigned tree_idx, set_idx;
+	uint16_t unaligned_pgs;
+
+	if (domain->id != seg->domain)
+		return;
+
+	KASSERT(seg->start >= domain->start,
+	    ("%s: ... %d", __func__, domain->id));
+	KASSERT(seg->end <= domain->end,
+	    ("%s: .... %d", __func__, domain->id));
+
+	// D'Oh! pgcount could be less than either VM_PGTREE_COUNT or VM_PGSET_COUNT
+	pg = (seg->start - domain->start) / PAGE_SIZE;
+	pgcount = (seg->end - seg->start) / PAGE_SIZE;
+
+	tree_idx = pg / VM_PGTREE_COUNT;
+	if ((unaligned_pgs = (pg & (VM_PGTREE_COUNT - 1)))) {
+		domain->trees[tree_idx].free += MIN(unaligned_pgs, pgcount);
+		tree_idx++;
+	}
+
+	set_idx = pg / VM_PGSET_COUNT;
+	if ((unaligned_pgs = (pg & (VM_PGSET_COUNT - 1)))) {
+		unaligned_pgs = MIN(unaligned_pgs, pgcount);
+		vm_pgset_init_partial(&domain->sets[set_idx], unaligned_pgs,
+		    true);
+		domain->counts[set_idx].free += unaligned_pgs;
+		pg++;
+	}
+
+	// uh, subtract unaligned pages from pgcount I guess ...
+	pgcount -= unaligned_pgs;
+
+	//unsigned sets = pgcount / 
+	// borked, doesnt account for alignment at all
+	unsigned trees = pgcount / VM_PGTREE_COUNT;
+	for (unsigned i = tree_idx; i < tree_idx + trees; i++) {
+		domain->trees[i].free += VM_PGTREE_COUNT;
+	}
+
 }
 
 static vm_pgidx_t
@@ -1957,6 +2098,23 @@ vm_pgcount_4x_revert(union vm_pgcount counts[4])
 
 	for (unsigned i = 0; i < 4; i++)
 		atomic_store_16(&counts[i].bits, VM_PGSET_COUNT);
+}
+
+static void
+vm_pgset_init_partial(struct vm_pgset *set, uint16_t pages, bool skip_front)
+{
+	uint16_t pg;
+	uint8_t word, bit;
+
+	KASSERT(pages < VM_PGSET_COUNT, ("%s: ...", __func__));
+
+	pg = (skip_front) ? VM_PGSET_COUNT - pages : 0;
+	while (pages > 0) {
+		word = pg / VM_PGSET_SIZE;
+		bit = pg & (VM_PGSET_SIZE - 1);
+		set->free[word] &= ~(1 << bit); 
+		pages--;
+	}
 }
 
 static inline unsigned

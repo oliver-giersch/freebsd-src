@@ -75,8 +75,7 @@ void vm_phys_add_seg(vm_paddr_t start, vm_paddr_t end);
 struct vm_page *vm_phys_seg_paddr_to_vm_page(const struct vm_phys_seg *seg,
     vm_paddr_t pa);
 
-void vm_phys_preinit(void);
-void vm_phys_init(void);
+void vm_phys_init(vm_offset_t *va);
 void vm_phys_register_domains(int ndomains, struct mem_affinity *affinity,
     int *locality);
 

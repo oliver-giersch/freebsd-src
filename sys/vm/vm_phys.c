@@ -93,6 +93,7 @@ domainset_t __read_mostly all_domains = DOMAINSET_T_INITIALIZER(0x1);
 
 struct vm_phys_seg __read_mostly vm_phys_segs[VM_PHYSSEG_MAX];
 int __read_mostly vm_phys_nsegs;
+
 static struct vm_phys_seg vm_phys_early_segs[8];
 static int vm_phys_early_nsegs;
 
@@ -523,7 +524,7 @@ vm_phys_add_seg(vm_paddr_t start, vm_paddr_t end)
  * Requires that vm_page_array is initialized!
  */
 void
-vm_phys_init(void)
+vm_phys_init(vm_offset_t *va __unused)
 {
 	struct vm_freelist *fl;
 	struct vm_phys_seg *end_seg, *prev_seg, *seg, *tmp_seg;

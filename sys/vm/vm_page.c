@@ -744,19 +744,10 @@ vm_page_startup(vm_offset_t vaddr)
 #endif
 	phys_avail[biggestone + 1] = new_end;
 
-	// XXX: vm_phys_preinit()? use vm_phys_early_alloc to allocate pgsets and so on
-
-	/*
-	 * Add physical memory segments corresponding to the available
-	 * physical pages.
-	 */
-	for (i = 0; phys_avail[i + 1] != 0; i += 2)
-		vm_phys_add_seg(phys_avail[i], phys_avail[i + 1]);
-
 	/*
 	 * Initialize the physical memory allocator.
 	 */
-	vm_phys_init();
+	vm_phys_init(&vaddr);
 
 	pool = VM_FREEPOOL_DEFAULT;
 #ifdef VM_FREEPOOL_LAZYINIT
