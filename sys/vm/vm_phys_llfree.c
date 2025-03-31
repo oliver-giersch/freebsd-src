@@ -119,6 +119,7 @@ static int vm_phys_avail_find(vm_paddr_t pa);
 #endif /* NUMA */
 
 static void vm_phys_domain_init(vm_offset_t *va);
+static void vm_phys_domain_init_segments(void);
 
 int
 vm_phys_avail_largest(void)
@@ -350,6 +351,7 @@ vm_phys_init(vm_offset_t *va)
 	/*
 	 *
 	 */
+	vm_phys_domain_init_segments();
 }
 
 static void
@@ -601,7 +603,7 @@ static struct vm_phys_domain domains[MAXMEMDOM];
 static union vm_pgcount *pgcounts;
 static union vm_pgtree *pgtrees;
 
-DPCPU_DEFINE_STATIC(union vm_pcpu_tree, reserved_tree[MAXMEMDOM]);
+DPCPU_DEFINE_STATIC(union vm_pcpu_tree, reserved_trees[MAXMEMDOM]);
 
 struct vm_phys_alloc_args {
 	uint16_t pages;
@@ -629,6 +631,8 @@ vm_page_order(u_long pages)
  * Allocates 2^O free physical pages.
  */
 
+static void vm_phys_domain_init_seg(struct vm_phys_domain *domain,
+    const struct vm_phys_seg *seg);
 static vm_pgidx_t vm_phys_domain_alloc(struct vm_phys_domain *domain,
     uint8_t order);
 static vm_pgidx_t vm_phys_domain_alloc_search(struct vm_phys_domain *domain,
@@ -727,6 +731,7 @@ static inline bool vm_pgcount_4x_alloc(union vm_pgcount counts[4],
     union vm_pgcount_4x *old);
 static void vm_pgcount_4x_revert(union vm_pgcount counts[4]);
 
+static void vm_pgset_init(struct vm_pgset *set);
 static void vm_pgset_init_partial(struct vm_pgset *set, uint16_t pages,
     bool skip_front);
 static inline unsigned vm_pgset_alloc_order_0(struct vm_pgset *set);
@@ -771,14 +776,38 @@ void
 vm_phys_free_pages(struct vm_page *m, int pool, int order)
 {
 	// FIXME: instead of segind/poolind/order, store pgidx?
-	vm_paddr_t pa;
+	// find domain, within domain, find pgidx/setidx/treeidx
+	struct vm_phys_domain *domain;
+	vm_paddr_t offset;
+	unsigned tree_idx, set_idx;
 	vm_pgidx_t pg;
 
 	KASSERT(order < VM_NFREEORDER,
 	    ("%s: order %d is out of range", __func__, order));
 
-	pa = VM_PAGE_TO_PHYS(m);
-	pg = pa / PAGE_SIZE;
+	domain = &domains[phys_segments.array[m->segind].domain];
+	offset = VM_PAGE_TO_PHYS(m) - domain->start;
+	tree_idx = offset / VM_PGTREE_COUNT;
+	set_idx = offset / VM_PGSET_COUNT;
+
+	// FIXME: check if tree is currently the local tree and, if so, free to that?
+	critical_enter();
+	union vm_pcpu_tree *local = DPCPU_PTR(reserved_trees[domain->id]);
+	union vm_pcpu_tree old = vm_pcpu_tree_load(local);
+
+	if (vm_pcpu_tree_get_tree(old) == tree_idx) {
+		// cas the tree with an added count
+		critical_exit();
+	} else {
+		critical_exit();
+		vm_pgtree_add(&domain->trees[tree_idx], 1 << order);
+	}
+
+	// increase count of domain->counts[seg_idx] by 1 << order;
+	// flip bit(s) in page sets
+
+	pg = offset / PAGE_SIZE;
+
 
 	/* flip the right bit in (global) pgsets */
 	/* add (1 << order) to pgcounts */
@@ -890,48 +919,13 @@ vm_phys_domain_init(vm_offset_t *va)
 		    "vm_phys_domain page counts.", __func__);
 }
 
-// XXX: moveup
 static void
-vm_phys_domain_init_seg(struct vm_phys_domain *domain, const struct vm_phys_seg *seg);
-
-static void
-vm_phys_domain_init2(void)
+vm_phys_domain_init_segments(void)
 {
-	struct vm_phys_domain *domain;
-	const struct vm_phys_seg *seg;
-	vm_pgidx_t pg;
-	uint64_t set_idx, tree_idx;
-	unsigned pgcount;
-	uint16_t unaligned_set_pgs;
-
 	for (int i = 0; i < vm_ndomains; i++) {
-		domain = &domains[i];
-		for (int j = 0; j < phys_segments.len; j++) {
-			seg = &phys_segments.array[j];
-			if (domain->id != seg->domain)
-				continue;
-
-			KASSERT(seg->start >= domain->start,
-			    ("%s: ...", __func__));
-			KASSERT(seg->end <= domain->end,
-			    ("%s: ....", __func__));
-			pg = (seg->start - domain->start) / PAGE_SIZE;
-			set_idx = pg / VM_PGSET_COUNT;
-			if (pg & (VM_PGSET_COUNT - 1))
-				vm_pgset_init_partial(&domain->sets[set_idx], MAX(pgcount, VM_PGSET_COUNT), true);
-
-
-			tree_idx = pg / VM_PGTREE_COUNT;
-			pgcount = (seg->end - seg->start) / PAGE_SIZE;
-
-			// XXX: advance pg until set aligned
-
-			for (unsigned k = 0; k < pgcount; k++) {
-
-			}
-			// add free count to trees + counts!
-			// flip bits in sets!
-		}
+		for (int j = 0; j < phys_segments.len; j++)
+			vm_phys_domain_init_seg(&domains[i],
+			    &phys_segments.array[j]);
 	}
 }
 
@@ -940,9 +934,9 @@ vm_phys_domain_init_seg(struct vm_phys_domain *domain,
     const struct vm_phys_seg *seg)
 {
 	vm_pgidx_t pg;
-	uint64_t pgcount;
+	uint64_t pgcount, remaining_pgs;
 	unsigned tree_idx, set_idx;
-	uint16_t unaligned_pgs;
+	uint16_t pgs;
 
 	if (domain->id != seg->domain)
 		return;
@@ -952,35 +946,51 @@ vm_phys_domain_init_seg(struct vm_phys_domain *domain,
 	KASSERT(seg->end <= domain->end,
 	    ("%s: .... %d", __func__, domain->id));
 
-	// D'Oh! pgcount could be less than either VM_PGTREE_COUNT or VM_PGSET_COUNT
-	pg = (seg->start - domain->start) / PAGE_SIZE;
+	pg = remaining_pgs = (seg->start - domain->start) / PAGE_SIZE;
 	pgcount = (seg->end - seg->start) / PAGE_SIZE;
 
+	/*
+	 * Initialize all segment page tree structures.
+	 */
 	tree_idx = pg / VM_PGTREE_COUNT;
-	if ((unaligned_pgs = (pg & (VM_PGTREE_COUNT - 1)))) {
-		domain->trees[tree_idx].free += MIN(unaligned_pgs, pgcount);
+	if ((pgs = (pg & (VM_PGTREE_COUNT - 1)))) {
+		pgs = MIN(pgs, pgcount);
+		domain->trees[tree_idx].free += pgs;
+		remaining_pgs -= pgs;
 		tree_idx++;
 	}
 
+	for (unsigned i = tree_idx; remaining_pgs > 0; i++) {
+		pgs = MAX(remaining_pgs, VM_PGTREE_COUNT);
+		domain->trees[i].free += pgs;
+		remaining_pgs -= pgs;
+	}
+
+	/*
+	 * Initialize all segment page count and set structures.
+	 */
 	set_idx = pg / VM_PGSET_COUNT;
-	if ((unaligned_pgs = (pg & (VM_PGSET_COUNT - 1)))) {
-		unaligned_pgs = MIN(unaligned_pgs, pgcount);
-		vm_pgset_init_partial(&domain->sets[set_idx], unaligned_pgs,
-		    true);
-		domain->counts[set_idx].free += unaligned_pgs;
-		pg++;
+	remaining_pgs = pgcount;
+	if ((pgs = (pg & (VM_PGSET_COUNT - 1)))) {
+		pgs = MIN(pgs, pgcount);
+		vm_pgset_init_partial(&domain->sets[set_idx], pgs, true);
+		domain->counts[set_idx].free += pgs;
+		remaining_pgs -= pgs;
+		set_idx++;
 	}
 
-	// uh, subtract unaligned pages from pgcount I guess ...
-	pgcount -= unaligned_pgs;
-
-	//unsigned sets = pgcount / 
-	// borked, doesnt account for alignment at all
-	unsigned trees = pgcount / VM_PGTREE_COUNT;
-	for (unsigned i = tree_idx; i < tree_idx + trees; i++) {
-		domain->trees[i].free += VM_PGTREE_COUNT;
+	for (unsigned i = set_idx; remaining_pgs > 0; i++) {
+		if (remaining_pgs >= VM_PGSET_COUNT) {
+			vm_pgset_init(&domain->sets[i]);
+			domain->counts[i].free += VM_PGSET_COUNT;
+			remaining_pgs -= VM_PGSET_COUNT;
+		} else {
+			vm_pgset_init_partial(&domain->sets[i], remaining_pgs,
+			    false);
+			domain->counts[i].free += remaining_pgs;
+			remaining_pgs = 0;
+		}
 	}
-
 }
 
 static vm_pgidx_t
@@ -993,7 +1003,7 @@ vm_phys_domain_alloc(struct vm_phys_domain *domain, uint8_t order)
 	pages = 1 << order;
 
 	critical_enter();
-	local = DPCPU_PTR(reserved_tree[domain->id]);
+	local = DPCPU_PTR(reserved_trees[domain->id]);
 
 	/*
 	 * Try to allocate the desired pages from the current CPU's reserved
@@ -2098,6 +2108,13 @@ vm_pgcount_4x_revert(union vm_pgcount counts[4])
 
 	for (unsigned i = 0; i < 4; i++)
 		atomic_store_16(&counts[i].bits, VM_PGSET_COUNT);
+}
+
+static void
+vm_pgset_init(struct vm_pgset *set)
+{
+	for (unsigned i = 0; i < VM_PGSET_SIZE; i++)
+		set->free[i] = (vm_pgset_t)0;
 }
 
 static void
