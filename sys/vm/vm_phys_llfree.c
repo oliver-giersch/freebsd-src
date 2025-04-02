@@ -349,7 +349,8 @@ vm_phys_init(vm_offset_t *va)
 	phys_segments.initialized = true;
 
 	/*
-	 *
+	 * Initialize the physical page allocator bitmasks and free page
+	 * counters for each domain and its physical memory segments.
 	 */
 	vm_phys_domain_init_segments();
 }
@@ -713,9 +714,12 @@ static int vm_pgcount_alloc_search_order_11(
     union vm_pgcount counts[VM_PGTREE_SETS]);
 static int vm_pgcount_alloc_search_order_12(
     union vm_pgcount counts[VM_PGTREE_SETS]);
+static void vm_pgcount_free(union vm_pgcount counts[], uint8_t order);
 static inline void vm_pgcount_free_order_0to8(union vm_pgcount *count,
     uint8_t order);
 static inline void vm_pgcount_free_order_9(union vm_pgcount *count);
+static void vm_pgcount_free_order_10to12(union vm_pgcount counts[],
+    uint8_t order);
 static void vm_pgcount_revert(union vm_pgcount *count, uint16_t pages,
     uint8_t order);
 
@@ -739,7 +743,11 @@ static inline int vm_pgset_alloc_order_1to5(struct vm_pgset *set,
     uint8_t order);
 static inline int vm_pgset_alloc_order_6to8(struct vm_pgset *set,
     uint8_t order);
-static inline void vm_pgset_free_order_0(struct vm_pgset *set, unsigned pg);
+static void vm_pgset_free_order_0to8(struct vm_pgset *set, vm_pgidx_t pg,
+    uint8_t order);
+static inline void vm_pgset_free_order_0(struct vm_pgset *set, vm_pgidx_t pg);
+static void vm_pgset_free_order_1to8(struct vm_pgset *set, vm_pgidx_t pg,
+    uint8_t order);
 static inline void vm_pgset_free(vm_pgidx_t pg);
 
 // XXX: remove this
@@ -779,18 +787,34 @@ vm_phys_free_pages(struct vm_page *m, int pool, int order)
 	// find domain, within domain, find pgidx/setidx/treeidx
 	struct vm_phys_domain *domain;
 	vm_paddr_t offset;
-	unsigned tree_idx, set_idx;
 	vm_pgidx_t pg;
+	unsigned tree_idx, set_idx;
 
 	KASSERT(order < VM_NFREEORDER,
 	    ("%s: order %d is out of range", __func__, order));
+	// XXX: alignment of page must match order!
 
 	domain = &domains[phys_segments.array[m->segind].domain];
 	offset = VM_PAGE_TO_PHYS(m) - domain->start;
+	pg = offset / PAGE_SIZE;
 	tree_idx = offset / VM_PGTREE_COUNT;
 	set_idx = offset / VM_PGSET_COUNT;
 
-	// FIXME: check if tree is currently the local tree and, if so, free to that?
+	/*
+	 * Clear the bits for the freed run of pages in the lowest-level page
+	 * sets and/or adjust the free count(s) in the corresponding
+	 * set-counters.
+	 */
+	if (order < 9)
+		vm_pgset_free_order_1to8(&domain->sets[set_idx], pg, order);
+	vm_pgcount_free(&domain->counts[set_idx], order);
+
+	/*
+	 * Add the freed pages back to the appropriate page trees.  Check, if
+	 * the corresponding tree is reserved by the current CPU, in which case
+	 * the added free pages go to the local representation, otherwise they
+	 * go directly to the global tree count.
+	 */
 	critical_enter();
 	union vm_pcpu_tree *local = DPCPU_PTR(reserved_trees[domain->id]);
 	union vm_pcpu_tree old = vm_pcpu_tree_load(local);
@@ -802,17 +826,6 @@ vm_phys_free_pages(struct vm_page *m, int pool, int order)
 		critical_exit();
 		vm_pgtree_add(&domain->trees[tree_idx], 1 << order);
 	}
-
-	// increase count of domain->counts[seg_idx] by 1 << order;
-	// flip bit(s) in page sets
-
-	pg = offset / PAGE_SIZE;
-
-
-	/* flip the right bit in (global) pgsets */
-	/* add (1 << order) to pgcounts */
-	/* add (1 << order) to pgtree */
-	/* add to PCPU free history */
 }
 
 void
@@ -1404,7 +1417,7 @@ vm_pcpu_tree_steal(int cpu_id, int domain, uint8_t order, uint16_t pages,
 		 * fail due to a race with any local operation of that CPU or
 		 * because of a concurrent steal attempt.
 		 */
-		remote = DPCPU_ID_PTR(cpu, reserved_tree[domain]);
+		remote = DPCPU_ID_PTR(cpu, reserved_trees[domain]);
 		old = vm_pcpu_tree_load(remote);
 		if (!vm_pcpu_tree_unreserve(remote, &old))
 			continue;
@@ -1899,7 +1912,6 @@ vm_pgcount_fcmpset(volatile union vm_pgcount *count, union vm_pgcount *old,
 	return (atomic_fcmpset_16(&count->bits, &old->bits, new.bits));
 }
 
-// rename to vm_pgcount_acquire
 static int
 vm_pgcount_alloc_search_order_0to9(union vm_pgcount counts[VM_PGTREE_SETS],
     uint16_t pages)
@@ -2000,6 +2012,17 @@ vm_pgcount_alloc_search_order_12(union vm_pgcount counts[VM_PGTREE_SETS])
 	return (-1);
 }
 
+static void
+vm_pgcount_free(union vm_pgcount counts[], uint8_t order)
+{
+	if (order < 9)
+		vm_pgcount_free_order_0to8(&counts[0], order);
+	else if (order == 9)
+		vm_pgcount_free_order_9(&counts[0]);
+	else
+		vm_pgcount_free_order_10to12(counts, order);
+}
+
 static inline void
 vm_pgcount_free_order_0to8(union vm_pgcount *count, uint8_t order)
 {
@@ -2018,6 +2041,14 @@ static inline void
 vm_pgcount_free_order_9(union vm_pgcount *count)
 {
 	atomic_store_16(&count->bits, VM_PGSET_COUNT);
+}
+
+static void
+vm_pgcount_free_order_10to12(union vm_pgcount counts[], uint8_t order)
+{
+	for (unsigned i = 0; i < (1 << order) / VM_PGSET_COUNT; i++)
+		// KASSERT: swap, previous == 0?
+		atomic_store_16(&counts[i].bits, VM_PGSET_COUNT);
 }
 
 static void
@@ -2211,14 +2242,52 @@ revert:
 	return (-1);
 }
 
+static void
+vm_pgset_free_order_0to8(struct vm_pgset sets[], vm_pgidx_t pg, uint8_t order)
+{
+	if (order == 0)
+		vm_pgset_free_order_0(&sets[0], pg);
+	else
+		vm_pgset_free_order_1to8(&sets[0], pg, order);
+}
+
 static inline void
-vm_pgset_free_order_0(struct vm_pgset *set, unsigned pg)
+vm_pgset_free_order_0(struct vm_pgset *set, vm_pgidx_t pg)
 {
 	unsigned word, bit;
 
 	word = pg / VM_PGSET_WORD;
 	bit = pg & (VM_PGSET_WORD - 1);
 	atomic_testandclear_64(&set->free[word], bit);
+}
+
+static void
+vm_pgset_free_order_1to8(struct vm_pgset *set, vm_pgidx_t pg, uint8_t order)
+{
+	uint16_t pages;
+	unsigned word, bit;
+	vm_pgset_t mask;
+
+	pages = 1 << order;
+	word = pg / VM_PGSET_WORD;
+
+	if (order < 6) {
+		bit = pg & (VM_PGSET_WORD - 1);
+
+		KASSERT(bit + pages <= VM_PGSET_WORD,
+		    ("%s: bad pg %lu alignment for order %u",
+		    __func__, pg, order));
+
+		mask = ((1 << pages) - 1) << bit;
+		atomic_clear_64(&set->free[word], mask);
+	} else {
+		KASSERT(word + (pages / VM_PGSET_SIZE),
+		    ("%s: bad pg %lu alignment for order %u",
+		    __func__, pg, order));
+
+		for (unsigned w = word; w < word + (pages / VM_PGSET_SIZE); w++)
+			atomic_store_64(&set->free[w], 0);
+	}
 }
 
 static inline void
