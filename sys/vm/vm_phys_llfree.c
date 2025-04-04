@@ -34,92 +34,9 @@ typedef unsigned vm_pgtree_idx_t; // fixme: better use uint64_t
  * typedef uint64_t vm_pgset_idx_t;
  */
 
-#ifdef VM_FREELIST_DMA32
-#define VM_DMA32_BOUNDARY ((vm_paddr_t)1 << 32)
-#endif /* VM_FREELIST_DMA32 */
-
-/*
- * Enforce the assumptions made by vm_phys_add_seg() and vm_phys_init() about
- * the ordering of the free list boundaries.
- */
-#if defined(VM_LOWMEM_BOUNDARY) && defined(VM_DMA32_BOUNDARY)
-CTASSERT(VM_LOWMEM_BOUNDARY < VM_DMA32_BOUNDARY);
-#endif /* VM_LOWMEM_BOUNDARY && VM_DMA32_BOUNDARY */
-
-/*
- * These "avail lists" are globals used to communicate boot-time physical
- * memory layout to other parts of the kernel.  Each physically contiguous
- * region of memory is defined by a start address at an even index and an
- * end address at the following odd index.  Each list is terminated by a
- * pair of zero entries.
- *
- * dump_avail tells the dump code what regions to include in a crash dump, and
- * phys_avail is all of the remaining physical memory that is available for
- * the vm system.
- *
- * Initially dump_avail and phys_avail are identical.  Boot time memory
- * allocations remove extents from phys_avail that may still be included
- * in dumps.
- */
-vm_paddr_t phys_avail[PHYS_AVAIL_COUNT];
-vm_paddr_t dump_avail[PHYS_AVAIL_COUNT];
-
-struct vm_phys_seg __read_mostly vm_phys_early_segs[8];
-int __read_mostly vm_phys_early_nsegs;
-
-struct vm_phys_seg __read_mostly vm_phys_segs[VM_PHYSSEG_MAX];
-int __read_mostly vm_phys_nsegs;
-
-#ifdef NUMA
-const struct mem_affinity __read_mostly *mem_affinity;
-int __read_mostly *mem_locality;
-#endif /* NUMA */
-
-int __read_mostly vm_ndomains = 1;
-domainset_t __read_mostly all_domains = DOMAINSET_T_INITIALIZER(0x1);
-
-/*
- * Ficticious Physical Memory Segments.
- */
-
-struct vm_phys_fictitious_seg;
-static int vm_phys_fictitious_cmp(struct vm_phys_fictitious_seg *,
-    struct vm_phys_fictitious_seg *);
-
-RB_HEAD(fict_tree, vm_phys_fictitious_seg) vm_phys_fictitious_tree =
-    RB_INITIALIZER(&vm_phys_fictitious_tree);
-
-struct vm_phys_fictitious_seg {
-	RB_ENTRY(vm_phys_fictitious_seg) node;
-	/* Memory region data */
-	vm_paddr_t	start, end;
-	struct vm_page	*first_page;
-};
-
-RB_GENERATE_STATIC(fict_tree, vm_phys_fictitious_seg, node,
-    vm_phys_fictitious_cmp);
-
-static struct rwlock_padalign vm_phys_fictitious_reg_lock;
-MALLOC_DEFINE(M_FICT_PAGES, "vm_fictitious", "Fictitious VM pages");
-
 /* Utility functions. */
 
 static inline bool is_aligned(void *ptr, uint32_t alignment);
-
-/*
- * Physical segment initialization.
- */
-
-static void vm_phys_create_seg(vm_paddr_t start, vm_paddr_t end);
-static void vm_phys_create_seg_domain(vm_paddr_t start, vm_paddr_t end,
-    int domain);
-
-static int vm_phys_avail_count(void);
-static void vm_phys_avail_check(int i);
-static int vm_phys_avail_split(vm_paddr_t pa, int i);
-#ifdef NUMA
-static int vm_phys_avail_find(vm_paddr_t pa);
-#endif /* NUMA */
 
 /*
  * Physical page allocator domain initialization.
@@ -127,214 +44,6 @@ static int vm_phys_avail_find(vm_paddr_t pa);
 
 static void vm_phys_domain_init(vm_offset_t *va);
 static void vm_phys_domain_init_segments(void);
-
-int
-vm_phys_avail_largest(void)
-{
-	vm_paddr_t sz, largesz;
-	int largest;
-
-	largest = 0;
-	largesz = 0;
-	for (int i = 0; phys_avail[i + 1]; i += 2) {
-		sz = vm_phys_avail_size(i);
-		if (sz > largesz) {
-			largesz = sz;
-			largest = i;
-		}
-	}
-
-	return (largest);
-}
-
-vm_paddr_t
-vm_phys_avail_size(int i)
-{
-	return (phys_avail[i + 1] - phys_avail[i]);
-}
-
-void
-vm_phys_early_startup(void)
-{
-	struct vm_phys_seg *seg;
-	int idx;
-
-	for (int i = 0; phys_avail[i + 1] != 0; i += 2) {
-		phys_avail[i] = round_page(phys_avail[i]);
-		phys_avail[i + 1] = trunc_page(phys_avail[i + 1]);
-	}
-
-	/* Convert all pre-established (early) segments. */
-	for (int i = 0; i < vm_phys_early_nsegs; i++) {
-		seg = &vm_phys_early_segs[i];
-		vm_phys_add_seg(seg->start, seg->end);
-	}
-
-	/* Disable early segment allocation. */
-	vm_phys_early_nsegs = -1;
-
-#ifdef NUMA
-	if (mem_affinity == NULL)
-		return;
-
-	for (int i = 0; i < mem_affinity[i].end != 0; i++) {
-		if ((idx = vm_phys_avail_find(mem_affinity[i].start)) != -1)
-			vm_phys_avail_split(mem_affinity[i].start, idx);
-
-		if ((idx = vm_phys_avail_find(mem_affinity[i].end)) != -1)
-			vm_phys_avail_split(mem_affinity[i].end, idx);
-	}
-#endif /* NUMA */
-	(void)idx;
-}
-
-void
-vm_phys_early_add_seg(vm_paddr_t start, vm_paddr_t end)
-{
-	struct vm_phys_seg *seg;
-
-	if (vm_phys_early_nsegs == -1)
-		panic("%s: called after initialization", __func__);
-	if (vm_phys_early_nsegs == nitems(vm_phys_early_segs))
-		panic("%s: ran out of early segments", __func__);
-
-	seg = &vm_phys_early_segs[vm_phys_early_nsegs++];
-	seg->start = start;
-	seg->end = end;
-}
-
-vm_paddr_t
-vm_phys_early_alloc(int domain, size_t alloc_size)
-{
-	int largest;
-	vm_paddr_t pa, start, end, size, largestsz, align;
-#ifdef NUMA
-	int mem_idx;
-#endif /* NUMA */
-
-	KASSERT(domain == -1 || (domain >= 0 && domain < vm_ndomains),
-	    ("%s: invalid domain index %d", __func__, domain));
-
-	largestsz = 0;
-	start = 0;
-	end = -1;
-
-#ifdef NUMA
-	if (mem_affinity != NULL) {
-		mem_idx = 0;
-		for (int i = 0;; i++) {
-			size = mem_affinity[i].end - mem_affinity[i].start;
-			if (size == 0)
-				break;
-			if (domain != -1 && mem_affinity[i].domain != domain)
-				continue;
-			if (size > largestsz) {
-				mem_idx = i;
-				largestsz = size;
-			}
-		}
-
-		start = mem_affinity[mem_idx].start;
-		end = mem_affinity[mem_idx].end;
-	}
-#endif /* NUMA */
-
-	/*
-	 * Now find the largest physical segment in within the desired NUMA
-	 * domain.
-	 */
-	largest = 0;
-	largestsz = 0;
-	for (int i = 0; phys_avail[i + 1]; i += 2) {
-		/* Skip out-of-range segments */
-		if (phys_avail[i + 1] - alloc_size < start
-		    || phys_avail[i + 1] > end)
-			continue;
-	
-		if ((size = vm_phys_avail_size(i)) > largestsz) {
-			largest = i;
-			largestsz = size;
-		}
-	}
-
-	alloc_size = round_page(alloc_size);
-
-	/*
-	 * Grab single pages from the front to reduce fragmentation.
-	 */
-	if (alloc_size == PAGE_SIZE) {
-		pa = phys_avail[largest];
-		phys_avail[largest] += PAGE_SIZE;
-		vm_phys_avail_check(largest);
-		return (pa);
-	}
-
-	/*
-	 * Naturally align large allocations.
-	 */
-	align = phys_avail[largest + 1] & (alloc_size - 1);
-	if (alloc_size + align > largestsz)
-		panic("%s: cannot find a large enough size\n", __func__);
-	if (align != 0
-	    && vm_phys_avail_split(phys_avail[largest + 1] - align, largest))
-		/* Wasting memory. */
-		phys_avail[largest + 1] -= align;
-
-	phys_avail[largest + 1] -= align;
-	vm_phys_avail_check(largest);
-	pa = phys_avail[largest + 1];
-	return (pa);
-}
-
-void
-vm_phys_add_seg(vm_paddr_t start, vm_paddr_t end)
-{
-	vm_paddr_t pa;
-
-	if (!is_aligned((void *)start, PAGE_SIZE))
-		panic("%s: start (%jx) is not page aligned", __func__,
-		   (uintmax_t)start);
-	if (!is_aligned((void *)end, PAGE_SIZE))
-		panic("%s: end (%jx) is not page aligned", __func__,
-		    (uintmax_t)end);
-	if (start > end)
-		panic("%s: start (%jx) > end (%jx)", __func__, (uintmax_t)start,
-		    (uintmax_t)end);
-
-	if (start == end)
-		return;
-
-	/*
-	 * Split the physical memory segment if it spans two or more free list
-	 * boundaries.
-	 */
-	pa = start;
-
-#ifdef VM_FREELIST_LOWMEM
-	if (pa < VM_LOWMEM_BOUNDARY && end > VM_LOWMEM_BOUNDARY) {
-		vm_phys_create_seg(pa, VM_LOWMEM_BOUNDARY);
-		pa = VM_LOWMEM_BOUNDARY;
-	}
-#endif /* VM_FREELIST_LOWMEM */
-
-#ifdef VM_FREELIST_DMA32
-	if (pa < VM_DMA32_BOUNDARY && end > VM_DMA32_BOUNDARY) {
-		vm_phys_create_seg(pa, VM_DMA32_BOUNDARY);
-		pa = VM_DMA32_BOUNDARY;
-	}
-#endif /* VM_FREELIST_LOWMEM */
-
-	vm_phys_create_seg(pa, end);
-}
-
-struct vm_page *
-vm_phys_seg_paddr_to_vm_page(const struct vm_phys_seg *seg, vm_paddr_t pa)
-{
-	KASSERT(pa >= seg->start && pa < seg->end,
-	    ("%s: pa %#jx is out of range", __func__, (uintmax_t)pa));
-
-	return (&seg->first_page[atop(pa - seg->start)]);
-}
 
 void
 vm_phys_init(vm_offset_t *va)
@@ -357,154 +66,6 @@ vm_phys_init(vm_offset_t *va)
 	 */
 	vm_phys_domain_init_segments();
 }
-
-static void
-vm_phys_create_seg(vm_paddr_t start, vm_paddr_t end)
-{
-#ifdef NUMA
-	const struct mem_affinity *ma;
-
-	if (mem_affinity == NULL) {
-		vm_phys_create_seg_domain(start, end, 0);
-		return;
-	}
-
-	for (int i = 0;; i++) {
-		ma = &mem_affinity[i];
-		if (ma->end == 0)
-			panic("%s: reached end of affinity info", __func__);
-		if (ma->end <= start)
-			continue;
-		if (ma->start > start)
-			panic("%s: no affinity info for start %jx", __func__,
-			    (uintmax_t)start);
-		if (ma->end >= end) {
-			vm_phys_create_seg_domain(start, end, ma->domain);
-			break;
-		}
-
-		vm_phys_create_seg_domain(start, ma->end, ma->domain);
-		start = ma->end;
-	}
-#else
-	vm_phys_create_seg_domain(start, end, 0);
-#endif /* NUMA */
-}
-
-static void
-vm_phys_create_seg_domain(vm_paddr_t start, vm_paddr_t end, int domain)
-{
-	struct vm_phys_seg *seg;
-
-	if (domain < 0 || domain >= vm_ndomains)
-		panic("%s: invalid domain %d (max = %d)", __func__, domain,
-		    vm_ndomains);
-	if (vm_phys_nsegs >= VM_PHYSSEG_MAX)
-		panic("%s: not enough storage for physical segments, "
-		    "increase VM_PHYSSEG_MAX", __func__);
-
-	seg = &vm_phys_segs[vm_phys_nsegs++];
-	while (seg > vm_phys_segs && seg[-1].start >= end) {
-		*seg = *(seg - 1);
-		seg--;
-	}
-
-	seg->start = start;
-	seg->end = end;
-	seg->domain = domain;
-
-	if (seg != vm_phys_segs && seg[-1].end > start)
-		panic("%s: overlapping physical segments: Current [%#jx,%#jx) "
-		    "at index %zu, previous [%#jx,%#jx)", __func__,
-		    (uintmax_t)start, (uintmax_t)end, seg - vm_phys_segs,
-		    (uintmax_t)seg[-1].start, (uintmax_t)seg[-1].end);
-}
-
-/*
- * Return the index of the first unused slot which may be the terminating
- * entry.
- */
-static int
-vm_phys_avail_count(void)
-{ 
-	for (int i = 0; i < PHYS_AVAIL_COUNT; i += 2)
-		if (phys_avail[i] == 0 && phys_avail[i + 1] == 0)
-			return (i);
- 
-	panic("%s: improperly terminated phys_avail[]", __func__);
-}
-
-/*
- * Assert that a phys_avail entry is valid.
- */
-static void
-vm_phys_avail_check(int i)
-{
-	if (i % 2 != 0)
-		panic("%s: chunk start index %d is not even.", __func__, i);
-	if (phys_avail[i] & PAGE_MASK)
-		panic("%s: unaligned phys_avail[%d]: %#jx", __func__, i,
-		    (intmax_t)phys_avail[i]);
-	if (phys_avail[i + 1] & PAGE_MASK)
-		panic("%s: unaligned phys_avail[%d + 1]: %#jx", __func__, i,
-		    (intmax_t)phys_avail[i + 1]);
-	if (phys_avail[i + 1] < phys_avail[i])
-		panic("%s: phys_avail[%d]: start %#jx > end %#jx", __func__, i,
-		    (intmax_t)phys_avail[i], (intmax_t)phys_avail[i + 1]);
-}
-
-/*
- * Split a chunk in phys_avail[] at the address 'pa'.
- *
- * 'pa' must be within a chunk (slots i and i + 1) or one of its boundaries.
- * Returns zero on actual split, in which case the two new chunks occupy slots
- * i to i + 3, else EJUSTRETURN if 'pa' was one of the boundaries (and no split
- * actually occurred) else ENOSPC if there are not enough slots in phys_avail[]
- * to represent the additional chunk caused by the split.
- */
-static int
-vm_phys_avail_split(vm_paddr_t pa, int i)
-{
-	int count;
-
-	vm_phys_avail_check(i);
-	if (pa < phys_avail[i] || pa > phys_avail[i + 1])
-		panic("%s: address %#jx not in range at slot %d [%#jx;%#jx].",
-		    __func__, (uintmax_t)pa, i,
-		    (uintmax_t)phys_avail[i], (uintmax_t)phys_avail[i + 1]);
-
-	if (pa == phys_avail[i] || pa == phys_avail[i + 1])
-		return (EJUSTRETURN);
-
-	count = vm_phys_avail_count();
-	if (count >= PHYS_AVAIL_ENTRIES)
-		return (ENOSPC);
-
-	memmove(&phys_avail[i + 2], &phys_avail[i],
-	    (count - i) * sizeof(phys_avail[0]));
-
-	phys_avail[i + 1] = pa;
-	phys_avail[i + 2] = pa;
-	vm_phys_avail_check(i);
-	vm_phys_avail_check(i + 2);
-
-	return (0);
-}
-
-#ifdef NUMA
-/*
- * Return the index of an overlapping phys_avail entry or -1.
- */
-static int
-vm_phys_avail_find(vm_paddr_t pa)
-{
-	for (int i = 0; phys_avail[i + 1] != 0; i += 2)
-		if (phys_avail[i] <= pa && phys_avail[i + 1] > pa)
-			return (i);
-
-	return (-1);
-}
-#endif /* NUMA */
 
 /*
  * Physical page allocation.
@@ -665,6 +226,33 @@ static vm_pgidx_t vm_phys_domain_alloc_search_all(
     const struct vm_phys_domain *domain, uint32_t neighbors_idx,
     uint32_t skip_idx, uint8_t order, uint16_t pages, uint16_t *reserved_pages);
 
+
+struct vm_page *
+vm_phys_alloc_contig(int domain, u_long npages, vm_paddr_t low, vm_paddr_t high,
+    u_long alignment, vm_paddr_t boundary)
+{
+	return (NULL);
+}
+
+struct vm_page *
+vm_phys_alloc_pages(int domain, int pool, int order)
+{
+	struct vm_phys_domain *phys_dom;
+	vm_pgidx_t pg;
+
+	KASSERT(domain >= 0 && domain < vm_ndomains,
+	    ("%s: invalid domain %d", __func__, domain));
+	KASSERT(0 <= order && order < VM_NFREEORDER,
+	    ("%s: invalid order %d", __func__, order));
+
+	phys_dom = &domains[domain];
+	if ((pg = vm_phys_domain_alloc(phys_dom, order)) == invalid_pgidx)
+		return (NULL);
+	// XXX: translate pgidx to vm_page, probably best to store first vm page array index in each domain, then do addition
+
+	return (NULL);
+}
+
 /*
  * DPCU tree free count acquire and release.
  */
@@ -773,8 +361,6 @@ static inline unsigned vm_pgset_alloc_order_0(struct vm_pgset *set);
 static inline int vm_pgset_alloc_order_1to5(struct vm_pgset *set,
     uint8_t order);
 static inline int vm_pgset_alloc_order_6to8(struct vm_pgset *set,
-    uint8_t order);
-static void vm_pgset_free_order_0to8(struct vm_pgset *set, vm_pgidx_t pg,
     uint8_t order);
 static inline void vm_pgset_free_order_0(struct vm_pgset *set, vm_pgidx_t pg);
 static void vm_pgset_free_order_1to8(struct vm_pgset *set, vm_pgidx_t pg,
@@ -1135,14 +721,14 @@ vm_phys_domain_alloc_contig(struct vm_phys_domain *domain,
 	 *   alignment/boundary, determine 
 	 *   
 	 */
-	unsigned i;
 	uint8_t order;
 	struct vm_phys_seg *seg;
 	vm_paddr_t range[2];
 
 	order = vm_page_order(args->pages);
+	(void)order;
 
-	for (i = domain->end_seg - 1; i >= domain->start_seg; i--) {
+	for (int i = vm_phys_nsegs - 1; i >= 0; i--) {
 		seg = &vm_phys_segs[i];
 		if (seg->start >= args->high)
 			break;
@@ -2413,13 +1999,6 @@ SYSCTL_OID(_vm, OID_AUTO, phys_segs,
     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0, sysctl_vm_phys_segs,
     "A", "Phys Seg Info");
 
-#ifdef NUMA
-static int sysctl_vm_phys_locality(SYSCTL_HANDLER_ARGS);
-SYSCTL_OID(_vm, OID_AUTO, phys_locality,
-    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
-    sysctl_vm_phys_locality, "A", "Phys Locality Info");
-#endif /* NUMA */
-
 static int
 sysctl_vm_phys_free(SYSCTL_HANDLER_ARGS)
 {
@@ -2473,38 +2052,9 @@ sysctl_vm_phys_segs(SYSCTL_HANDLER_ARGS)
 		sbuf_printf(&sbuf, "end:       %#jx\n",
 		    (uintmax_t)seg->end);
 		sbuf_printf(&sbuf, "domain:    %d\n", seg->domain);
-		sbuf_printf(&sbuf, "free list: %p\n", seg->free_queues);
 	}
 
 	error = sbuf_finish(&sbuf);
 	sbuf_delete(&sbuf);
 	return (error);
 }
-
-#ifdef NUMA
-/*
- * Outputs the VM locality table.
- */
-static int
-sysctl_vm_phys_locality(SYSCTL_HANDLER_ARGS)
-{
-	struct sbuf sbuf;
-	int error;
-
-	if ((error = sysctl_wire_old_buffer(req, 0)) != 0)
-		return (error);
-	sbuf_new_for_sysctl(&sbuf, NULL, 128, req);
-	sbuf_printf(&sbuf, "\n");
-
-	for (int i = 0; i < vm_ndomains; i++) {
-		sbuf_printf(&sbuf, "%d: ", i);
-		for (int j = 0; j < vm_ndomains; j++)
-			sbuf_printf(&sbuf, "%d ", vm_phys_mem_affinity(i, j));
-		sbuf_printf(&sbuf, "\n");
-	}
-
-	error = sbuf_finish(&sbuf);
-	sbuf_delete(&sbuf);
-	return (error);
-}
-#endif /* NUMA */

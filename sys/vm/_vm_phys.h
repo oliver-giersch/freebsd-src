@@ -52,10 +52,12 @@ TAILQ_HEAD(pglist, vm_page);
 struct vm_page;
 struct vm_reserv;
 
+#ifndef LLFREE
 struct vm_freelist {
 	struct pglist pl;
 	int lcnt;
 };
+#endif /* !LLFREE */
 
 struct vm_phys_seg {
 	vm_paddr_t		start;
@@ -68,7 +70,9 @@ struct vm_phys_seg {
 	void			*md_first;
 #endif /* __aarch64__ */
 	int			domain;
+#ifndef LLFREE
 	struct vm_freelist 	(*free_queues)[VM_NFREEPOOL][VM_NFREEORDER_MAX];
+#endif /* !LLFREE */
 };
 
 extern struct vm_phys_seg vm_phys_segs[];

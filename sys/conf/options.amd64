@@ -68,3 +68,6 @@ MPTABLE_LINUX_BUG_COMPAT
 
 # x86 specific uart options
 UART_NS8250_EARLY_PORT	opt_uart.h
+
+# LLFree physical page allocator
+LLFREE			opt_global.h
